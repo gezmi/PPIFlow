@@ -1,0 +1,44 @@
+# PPIFlow Snakemake Configuration -- Minimal Defaults
+#
+# Only input_file, output_dir, and af3_home are required.
+# All other parameters have sensible defaults.
+#
+# Usage:
+#   snakemake --snakefile workflow/Snakefile \
+#     --configfile workflow/config_default.yaml \
+#     --config input_file=/path/to/complex.cif output_dir=/path/to/output \
+#     target_affinity
+
+# --- Required (user must set these) ---
+input_file: "/path/to/complex.cif"    # Input CIF or PDB file
+output_dir: "/path/to/output"          # Output directory
+
+# --- Pipeline mode ---
+# mode: "affinity"                     # "denovo", "affinity", or "full"
+
+# --- Optional (sensible defaults -- uncomment to override) ---
+# name: "target"                       # Auto-derived from input filename
+# input_type: "cif"                    # Auto-detected from file extension
+# nanobody_chain: "B"                  # Nanobody chain ID in input file
+# receptor_chain: "A"                  # Receptor chain ID in input file
+# energy_threshold: -5.0               # Key contact energy cutoff (REU)
+# start_t: 0.6                         # Partial flow start time (0-1)
+# samples_per_target: 8                # Backbone samples to generate
+# num_seq_per_target: 4                # AbMPNN sequences per backbone
+# sampling_temp: 0.1                   # AbMPNN sampling temperature
+
+# --- De novo mode (only when mode=denovo) ---
+# framework_pdb: "Framework/7xl0_nanobody_framework.pdb"
+# antigen_chain: "C"                   # Antigen chain in input PDB
+# heavy_chain: "H"                     # Heavy chain in framework PDB
+# cdr_length: "CDRH1,5-12,CDRH2,4-17,CDRH3,5-26"
+# specified_hotspots: ""               # e.g. "C100,C120" (required for denovo)
+
+# --- AF3Score (only needed for target_full) ---
+# af3score_dir: "/path/to/af3score"    # Path to AF3Score installation
+# af3score_num_jobs: 4                 # Number of AF3Score batch jobs
+
+# --- AF3 Refold ---
+# af3_home: "/home/labs/schreiber/Collaboration/softwares/af3"
+# af3_refold_seeds: 20                 # Number of AF3 model seeds for refolding
+# af3_model_dir: ""                    # AF3 model weights dir (defaults to AF3 internal)

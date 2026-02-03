@@ -35,190 +35,182 @@ def file_name(file_dir):
                 L.append(os.path.join(root , file))
         return L
 
+def create_score_functions():
+    """Create all score functions needed for relaxation and scoring.
+
+    Must be called per-worker since PyRosetta C++ objects are not picklable.
+    """
+    sfxns = {}
+    sfxns['scorefxn'] = get_score_function()
+    sfxns['fa_atr'] = ScoreFunction(); sfxns['fa_atr'].set_weight(fa_atr, 1.0)
+    sfxns['fa_rep'] = ScoreFunction(); sfxns['fa_rep'].set_weight(fa_rep, 1.0)
+    sfxns['fa_intra_rep'] = ScoreFunction(); sfxns['fa_intra_rep'].set_weight(fa_intra_rep, 1.0)
+    sfxns['fa_sol'] = ScoreFunction(); sfxns['fa_sol'].set_weight(fa_sol, 1.0)
+    sfxns['lk_ball_wtd'] = ScoreFunction(); sfxns['lk_ball_wtd'].set_weight(lk_ball_wtd, 1.0)
+    sfxns['fa_intra_sol'] = ScoreFunction(); sfxns['fa_intra_sol'].set_weight(fa_intra_sol, 1.0)
+    sfxns['fa_elec'] = ScoreFunction(); sfxns['fa_elec'].set_weight(fa_elec, 1.0)
+    sfxns['hbond_lr_bb'] = ScoreFunction(); sfxns['hbond_lr_bb'].set_weight(hbond_lr_bb, 1.0)
+    sfxns['hbond_sr_bb'] = ScoreFunction(); sfxns['hbond_sr_bb'].set_weight(hbond_sr_bb, 1.0)
+    sfxns['hbond_bb_sc'] = ScoreFunction(); sfxns['hbond_bb_sc'].set_weight(hbond_bb_sc, 1.0)
+    sfxns['hbond_sc'] = ScoreFunction(); sfxns['hbond_sc'].set_weight(hbond_sc, 1.0)
+    sfxns['dslf_fa13'] = ScoreFunction(); sfxns['dslf_fa13'].set_weight(dslf_fa13, 1.0)
+    sfxns['rama_prepro'] = ScoreFunction(); sfxns['rama_prepro'].set_weight(rama_prepro, 1.0)
+    sfxns['p_aa_pp'] = ScoreFunction(); sfxns['p_aa_pp'].set_weight(p_aa_pp, 1.0)
+    sfxns['fa_dun'] = ScoreFunction(); sfxns['fa_dun'].set_weight(fa_dun, 1.0)
+    sfxns['omega'] = ScoreFunction(); sfxns['omega'].set_weight(omega, 1.0)
+    sfxns['pro_close'] = ScoreFunction(); sfxns['pro_close'].set_weight(pro_close, 1.0)
+    sfxns['yhh_planarity'] = ScoreFunction(); sfxns['yhh_planarity'].set_weight(yhh_planarity, 1.0)
+    sfxns['ref'] = ScoreFunction(); sfxns['ref'].set_weight(ref, 1.0)
+    sfxns['rg'] = ScoreFunction(); sfxns['rg'].set_weight(rg, 1)
+    return sfxns
+
+
+def process_single_pdb(task):
+    """Worker function to process a single PDB file.
+
+    Args:
+        task: dict with keys 'pdb_path', 'args', 'interface' (str or None)
+
+    Returns:
+        (pdb_name, temp_dict) on success, None on failure.
+    """
+    pdb_path = task['pdb_path']
+    args = task['args']
+    interface = task['interface']
+
+    try:
+        sfxns = create_score_functions()
+        scorefxn = sfxns['scorefxn']
+        fixed_chain = args.fixed_chain.split("_")
+
+        start = time.time()
+        pdb_name = os.path.basename(pdb_path).replace(".pdb", "")
+        pose = pose_from_pdb(pdb_path)
+        original_pose = pose.clone()
+
+        # FastRelax
+        if args.relax:
+            fr = FastRelax()
+            fr.set_scorefxn(scorefxn)
+            fr.max_iter(int(args.max_iter))
+            movemap = MoveMap()
+            movemap.set_bb(True)
+            movemap.set_chi(True)
+
+            if args.fixbb:
+                for i in range(1, pose.total_residue() + 1):
+                    chain = pose.pdb_info().chain(i)
+                    if chain in fixed_chain:
+                        movemap.set_bb(i, False)
+                    else:
+                        movemap.set_bb(i, True)
+            fr.set_movemap(movemap)
+
+        if (not os.getenv("DEBUG")) and (args.relax):
+            if 'fr' in locals():
+                fr.apply(pose)
+
+        # Interface analysis
+        ia = InterfaceAnalyzerMover()
+        if interface is not None:
+            ia.set_interface(interface)
+        else:
+            print(f"Warning: No interface information provided for {pdb_name}. Using default interface.")
+        ia.set_skip_reporting(True)
+        ia.apply(pose)
+
+        time_consumed = time.time() - start
+
+        # Collect scores - preserve exact key names including 'hbond_sr_bb(pose)' for CSV compatibility
+        temp_dict = {
+            'relaxed': scorefxn(pose),
+            'interface_score': ia.get_interface_dG(),
+            'original': scorefxn(original_pose),
+            'delta': scorefxn(pose) - scorefxn(original_pose),
+            'fa_atr': sfxns['fa_atr'](pose),
+            'fa_rep': sfxns['fa_rep'](pose),
+            'fa_intra_rep': sfxns['fa_intra_rep'](pose),
+            'fa_sol': sfxns['fa_sol'](pose),
+            'lk_ball_wtd': sfxns['lk_ball_wtd'](pose),
+            'fa_intra_sol': sfxns['fa_intra_sol'](pose),
+            'fa_elec': sfxns['fa_elec'](pose),
+            'hbond_lr_bb': sfxns['hbond_lr_bb'](pose),
+            'hbond_sr_bb(pose)': sfxns['hbond_sr_bb'](pose),
+            'hbond_bb_sc': sfxns['hbond_bb_sc'](pose),
+            'hbond_sc': sfxns['hbond_sc'](pose),
+            'dslf_fa13': sfxns['dslf_fa13'](pose),
+            'rama_prepro': sfxns['rama_prepro'](pose),
+            'p_aa_pp': sfxns['p_aa_pp'](pose),
+            'fa_dun': sfxns['fa_dun'](pose),
+            'omega': sfxns['omega'](pose),
+            'pro_close': sfxns['pro_close'](pose),
+            'yhh_planarity': sfxns['yhh_planarity'](pose),
+            'ref': sfxns['ref'](pose),
+            'get_complexed_sasa': ia.get_complexed_sasa(),
+            'get_interface_delta_sasa': ia.get_interface_delta_sasa(),
+            'time_consumed': time_consumed,
+        }
+
+        if args.dump_pdb:
+            pose.dump_pdb(os.path.join(args.output_dir, 'relax_' + os.path.basename(pdb_path)))
+
+        return (pdb_name, temp_dict)
+
+    except Exception as e:
+        print(f"Error processing {pdb_path}: {e}")
+        return None
+
+
 def main(args):
-    
-    output = []
-    
-    # --- 修复 Bug 4: 将 ScoreFunction 定义移到循环外部以提高效率 ---
-    # 定义用于 Relax 和总分的 ScoreFunction (通常是默认的 ref2015 或其他)
-    scorefxn = get_score_function() 
-    
-    # 定义用于单项评分的 ScoreFunction
-    scorefxn_fa_atr = ScoreFunction(); scorefxn_fa_atr.set_weight(fa_atr, 1.0)
-    scorefxn_fa_rep = ScoreFunction(); scorefxn_fa_rep.set_weight(fa_rep, 1.0)
-    scorefxn_fa_intra_rep = ScoreFunction(); scorefxn_fa_intra_rep.set_weight(fa_intra_rep, 1.0)
-    scorefxn_fa_sol = ScoreFunction(); scorefxn_fa_sol.set_weight(fa_sol, 1.0)
-    scorefxn_lk_ball_wtd = ScoreFunction(); scorefxn_lk_ball_wtd.set_weight(lk_ball_wtd, 1.0)
-    scorefxn_fa_intra_sol = ScoreFunction(); scorefxn_fa_intra_sol.set_weight(fa_intra_sol, 1.0)
-    scorefxn_fa_elec = ScoreFunction(); scorefxn_fa_elec.set_weight(fa_elec, 1.0)
-    scorefxn_hbond_lr_bb = ScoreFunction(); scorefxn_hbond_lr_bb.set_weight(hbond_lr_bb, 1.0)
-    scorefxn_hbond_sr_bb = ScoreFunction(); scorefxn_hbond_sr_bb.set_weight(hbond_sr_bb, 1.0)
-    scorefxn_hbond_bb_sc = ScoreFunction(); scorefxn_hbond_bb_sc.set_weight(hbond_bb_sc, 1.0)
-    scorefxn_hbond_sc = ScoreFunction(); scorefxn_hbond_sc.set_weight(hbond_sc, 1.0)
-    scorefxn_dslf_fa13 = ScoreFunction(); scorefxn_dslf_fa13.set_weight(dslf_fa13, 1.0)
-    scorefxn_rama_prepro = ScoreFunction(); scorefxn_rama_prepro.set_weight(rama_prepro, 1.0)
-    scorefxn_p_aa_pp = ScoreFunction(); scorefxn_p_aa_pp.set_weight(p_aa_pp, 1.0)
-    scorefxn_fa_dun = ScoreFunction(); scorefxn_fa_dun.set_weight(fa_dun, 1.0)
-    scorefxn_omega = ScoreFunction(); scorefxn_omega.set_weight(omega, 1.0)
-    scorefxn_pro_close = ScoreFunction(); scorefxn_pro_close.set_weight(pro_close, 1.0)
-    scorefxn_yhh_planarity = ScoreFunction(); scorefxn_yhh_planarity.set_weight(yhh_planarity, 1.0)
-    scorefxn_ref = ScoreFunction(); scorefxn_ref.set_weight(ref, 1.0)
-    scorefxn_rg = ScoreFunction(); scorefxn_rg.set_weight(rg , 1 )
-    
-    # 预处理固定链信息
-    fixed_chain = args.fixed_chain.split("_")
-    
-    # --- 修复 Bug 1 & 2: 分离两种模式，解决 NameError 和迭代源错误 ---
+    # Build task list
+    tasks = []
 
     if args.csv_path != "":
-        # --- 模式 1: 使用 CSV 文件 (包含额外信息) ---
+        # Mode 1: CSV file with PDB paths and optional interface info
         df = pd.read_csv(args.csv_path)
-        
+
         if len(df) == 0:
             print(f"CSV file at {args.csv_path} is empty.")
             return
 
         print(f"Processing {len(df)} pdb from CSV")
-        # 循环遍历 DataFrame 的每一行，获取 PDB 路径和界面信息
         for idx, row in df.iterrows():
-            pdb = row["pdb"]
-            pdb_path = pdb # 保持变量名与原始代码一致
-
-            # --------------------------- 核心计算代码 (保持不变) ---------------------------
-            start = time.time()
-            pdb_name = os.path.basename(pdb_path).replace(".pdb","")
-            pose = pose_from_pdb(pdb_path)
-            original_pose = pose.clone()
-            
-            # FastRelax 设置和应用
-            if args.relax:
-                fr = FastRelax()
-                fr.set_scorefxn(scorefxn)
-                fr.max_iter(int(args.max_iter))
-                movemap = MoveMap()
-                movemap.set_bb(True)
-                movemap.set_chi(True)
-                
-                if args.fixbb:
-                    for i in range(1, pose.total_residue() + 1):
-                        chain = pose.pdb_info().chain(i)
-                        if chain in fixed_chain:
-                            movemap.set_bb(i, False)
-                        else:
-                            movemap.set_bb(i, True)
-                fr.set_movemap(movemap)
-            
-            # 应用 Relax
-            if (not os.getenv("DEBUG")) and (args.relax):
-                # 确保在 fr 存在时才调用 apply
-                if 'fr' in locals():
-                     fr.apply(pose)
-            
-            # interface analysis and energy calculation
-            ia = InterfaceAnalyzerMover()
-            # 在 CSV 模式下，可以安全地从 row 中获取 interface 信息
+            pdb_path = row["pdb"]
+            interface = None
             if ("ligand" in df.columns) and ("receptor" in df.columns):
-                interface = row["ligand"].replace(",","")+"_"+row["receptor"].replace(",","")
-                ia.set_interface(interface)
+                interface = row["ligand"].replace(",", "") + "_" + row["receptor"].replace(",", "")
             else:
-                 # ⚠️ 警告：如果 CSV 缺少这两列，InterfaceAnalyzerMover 将使用默认界面（所有链）
-                 print(f"Warning: 'ligand' or 'receptor' column missing for {pdb_name}. Using default interface.")
-
-            ia.set_skip_reporting(True)
-            ia.apply(pose)
-
-            time_consumed = time.time()-start
-
-            # 结果收集 (保持不变)
-            temp_dict = {'relaxed':scorefxn(pose),'interface_score':ia.get_interface_dG(), 
-            'original':scorefxn(original_pose),'delta':scorefxn(pose) - scorefxn(original_pose),
-            'fa_atr':scorefxn_fa_atr(pose),'fa_rep':scorefxn_fa_rep(pose),'fa_intra_rep':scorefxn_fa_intra_rep(pose),
-            'fa_sol':scorefxn_fa_sol(pose),'lk_ball_wtd':scorefxn_lk_ball_wtd(pose),'fa_intra_sol':scorefxn_fa_intra_sol(pose),
-            'fa_elec':scorefxn_fa_elec(pose),'hbond_lr_bb':scorefxn_hbond_lr_bb(pose),'hbond_sr_bb(pose)':scorefxn_hbond_sr_bb(pose),
-            'hbond_bb_sc':scorefxn_hbond_bb_sc(pose),'hbond_sc':scorefxn_hbond_sc(pose),'dslf_fa13':scorefxn_dslf_fa13(pose),
-            'rama_prepro':scorefxn_rama_prepro(pose),'p_aa_pp':scorefxn_p_aa_pp(pose),'fa_dun':scorefxn_fa_dun(pose),
-            'omega':scorefxn_omega(pose),'pro_close':scorefxn_pro_close(pose),'yhh_planarity':scorefxn_yhh_planarity(pose),
-            'ref':scorefxn_ref(pose), 'get_complexed_sasa':ia.get_complexed_sasa(),
-            'get_interface_delta_sasa':ia.get_interface_delta_sasa(), 'time_consumed': time_consumed}
-
-            if args.dump_pdb: pose.dump_pdb(os.path.join(args.output_dir, 'relax_' + os.path.basename(pdb_path)))
-
-            output.append([pdb_name]+[v for k, v in temp_dict.items()])
-            # --------------------------- 核心计算代码结束 ---------------------------
-
+                print(f"Warning: 'ligand' or 'receptor' column missing for {os.path.basename(pdb_path)}. Using default interface.")
+            tasks.append({'pdb_path': pdb_path, 'args': args, 'interface': interface})
     else:
-        # --- 模式 2: 使用 PDB 文件夹 (只获取文件路径) ---
+        # Mode 2: PDB directory
         all_pdb_name = sorted(glob.glob(os.path.join(args.pdb_dir, '*.pdb')))
-        
+
         if len(all_pdb_name) > 0:
             print(f"Processing {len(all_pdb_name)} pdb in {args.pdb_dir}")
         else:
             print(f"No pdb available in {args.pdb_dir}")
             return
-            
-        # 循环遍历 PDB 文件的路径列表
-        for pdb_path in all_pdb_name: 
 
-            # --------------------------- 核心计算代码 (保持不变) ---------------------------
-            start = time.time()
-            pdb_name = os.path.basename(pdb_path).replace(".pdb","")
-            pose = pose_from_pdb(pdb_path)
-            original_pose = pose.clone()
-            
-            # FastRelax 设置和应用
-            if args.relax:
-                fr = FastRelax()
-                fr.set_scorefxn(scorefxn)
-                fr.max_iter(int(args.max_iter))
-                movemap = MoveMap()
-                movemap.set_bb(True)
-                movemap.set_chi(True)
-                
-                if args.fixbb:
-                    for i in range(1, pose.total_residue() + 1):
-                        chain = pose.pdb_info().chain(i)
-                        if chain in fixed_chain:
-                            movemap.set_bb(i, False)
-                        else:
-                            movemap.set_bb(i, True)
-                fr.set_movemap(movemap)
-            
-            # 应用 Relax
-            if (not os.getenv("DEBUG")) and (args.relax):
-                 if 'fr' in locals():
-                     fr.apply(pose)
+        for pdb_path in all_pdb_name:
+            tasks.append({'pdb_path': pdb_path, 'args': args, 'interface': None})
 
-            # interface analysis and energy calculation
-            ia = InterfaceAnalyzerMover()
-            # ⚠️ 注意：在此模式下，没有 interface 信息，InterfaceAnalyzerMover 将使用默认界面
-            print(f"Warning: No interface information provided for {pdb_name}. Using default interface.")
-            ia.set_skip_reporting(True)
-            ia.apply(pose)
+    # Process tasks
+    if args.num_workers > 1:
+        print(f"Using {args.num_workers} parallel workers")
+        with Pool(args.num_workers) as pool:
+            results = pool.map(process_single_pdb, tasks)
+    else:
+        results = [process_single_pdb(t) for t in tasks]
 
-            time_consumed = time.time()-start
+    # Collect results, filter failures
+    results = [r for r in results if r is not None]
 
-            # 结果收集 (保持不变)
-            temp_dict = {'relaxed':scorefxn(pose),'interface_score':ia.get_interface_dG(), 
-            'original':scorefxn(original_pose),'delta':scorefxn(pose) - scorefxn(original_pose),
-            'fa_atr':scorefxn_fa_atr(pose),'fa_rep':scorefxn_fa_rep(pose),'fa_intra_rep':scorefxn_fa_intra_rep(pose),
-            'fa_sol':scorefxn_fa_sol(pose),'lk_ball_wtd':scorefxn_lk_ball_wtd(pose),'fa_intra_sol':scorefxn_fa_intra_sol(pose),
-            'fa_elec':scorefxn_fa_elec(pose),'hbond_lr_bb':scorefxn_hbond_lr_bb(pose),'hbond_sr_bb(pose)':scorefxn_hbond_sr_bb(pose),
-            'hbond_bb_sc':scorefxn_hbond_bb_sc(pose),'hbond_sc':scorefxn_hbond_sc(pose),'dslf_fa13':scorefxn_dslf_fa13(pose),
-            'rama_prepro':scorefxn_rama_prepro(pose),'p_aa_pp':scorefxn_p_aa_pp(pose),'fa_dun':scorefxn_fa_dun(pose),
-            'omega':scorefxn_omega(pose),'pro_close':scorefxn_pro_close(pose),'yhh_planarity':scorefxn_yhh_planarity(pose),
-            'ref':scorefxn_ref(pose), 'get_complexed_sasa':ia.get_complexed_sasa(),
-            'get_interface_delta_sasa':ia.get_interface_delta_sasa(), 'time_consumed': time_consumed}
-
-            if args.dump_pdb: pose.dump_pdb(os.path.join(args.output_dir, 'relax_' + os.path.basename(pdb_path)))
-
-            output.append([pdb_name]+[v for k, v in temp_dict.items()])
-            # --------------------------- 核心计算代码结束 ---------------------------
-
-    # 循环结束后，统一将 output 写入 CSV
-    if len(output) > 0:
-        # 使用其中一个 temp_dict 结构来确定列名
-        score_df = pd.DataFrame(output, columns=['pdb_name']+list(temp_dict.keys()))
-        score_df.to_csv(os.path.join(args.output_dir, f'rosetta_complex_{args.batch_idx}.csv'),index=False)
+    if len(results) > 0:
+        output = [[pdb_name] + [v for v in temp_dict.values()] for pdb_name, temp_dict in results]
+        columns = ['pdb_name'] + list(results[0][1].keys())
+        score_df = pd.DataFrame(output, columns=columns)
+        score_df.to_csv(os.path.join(args.output_dir, f'rosetta_complex_{args.batch_idx}.csv'), index=False)
     else:
         print("No results to write. Output list is empty.")
 
@@ -230,11 +222,12 @@ if __name__ == "__main__":
     parser.add_argument('--csv_path',type=str, default="", help="save absolute path of pdb file in the 'pdb' column")
     parser.add_argument('--output_dir',type=str, help="output relaxed pdb path", required=True)
     parser.add_argument('--dump_pdb', default= False, type=bool_type, help="dump pdb or not")
-    parser.add_argument('--batch_idx', type=int, default= False, help="batch index for output filename") # 修复 default 类型
-    parser.add_argument('--relax', default= False, type=bool_type, help="run relax or not") # 修复 help 文本
-    parser.add_argument('--fixbb', default= False, type=bool_type, help="fix backbone or not") # 修复 help 文本
-    parser.add_argument('--fixed_chain', default="", type=str, help="chains whose backbone should be fixed (e.g., 'A_B')") # 修复 help 文本
-    parser.add_argument('--max_iter', default=1, type=int, help="max iteration for FastRelax") # 修复 help 文本
+    parser.add_argument('--batch_idx', type=int, default= False, help="batch index for output filename")
+    parser.add_argument('--relax', default= False, type=bool_type, help="run relax or not")
+    parser.add_argument('--fixbb', default= False, type=bool_type, help="fix backbone or not")
+    parser.add_argument('--fixed_chain', default="", type=str, help="chains whose backbone should be fixed (e.g., 'A_B')")
+    parser.add_argument('--max_iter', default=1, type=int, help="max iteration for FastRelax")
+    parser.add_argument('--num_workers', default=len(os.sched_getaffinity(0)), type=int, help="number of parallel workers for processing PDBs (default: all available CPUs)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
