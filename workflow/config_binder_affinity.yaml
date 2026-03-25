@@ -1,0 +1,34 @@
+# PPIFlow Snakemake Configuration -- Binder Affinity Maturation
+#
+# Usage:
+#   snakemake --snakefile workflow/Snakefile \
+#     --configfile workflow/config_binder_affinity.yaml \
+#     --config input_file=/path/to/complex.pdb output_dir=/path/to/output \
+#     af3score_dir=/path/to/af3score af3_home=/path/to/af3 \
+#     -- target_binder_affinity
+
+# --- Required (user must set these) ---
+input_file: "/path/to/complex.pdb"    # Input PDB file (target + binder)
+output_dir: "/path/to/output"          # Output directory
+
+# --- Pipeline mode ---
+mode: "binder_affinity"
+
+# --- Chain IDs in input file ---
+# nanobody_chain: "B"                  # Binder chain ID (renamed to A internally)
+# receptor_chain: "A"                  # Target/receptor chain ID (renamed to C internally)
+
+# --- Design parameters ---
+# energy_threshold: -5.0               # Key contact energy cutoff (REU)
+# start_t: 0.65                        # Partial flow start time (0-1, higher=more conservative)
+# samples_per_target: 8                # Backbone samples to generate
+# num_seq_per_target: 4                # ProteinMPNN sequences per backbone
+# sampling_temp: 0.1                   # ProteinMPNN sampling temperature
+
+# --- AF3Score (required for target_binder_affinity) ---
+# af3score_dir: "/path/to/af3score"    # Path to AF3Score installation
+# af3score_num_jobs: 25                # Number of AF3Score batch jobs
+
+# --- AF3 Refold ---
+# af3_home: "/home/labs/schreiber/Collaboration/softwares/af3"
+# af3_refold_seeds: 20

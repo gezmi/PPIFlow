@@ -1,0 +1,79 @@
+# PPIFlow Two-Round De Novo Nanobody Design Pipeline (Metal-Ion-Aware)
+#
+# Same as nanobody_full but with LigandMPNN for sequence design and
+# ion-aware AF3Score JSONs, for targets that coordinate a metal ion
+# (Zn2+, Mg2+, etc.) that the designed nanobody CDRs will also coordinate.
+#
+# Flow model is protein-only and unchanged.
+# Only seqdesign (LigandMPNN instead of AbMPNN) and AF3Score JSON
+# preparation differ. Framework fixed positions are still derived from
+# b-factors (make_fix_csv.py) and passed to LigandMPNN.
+#
+# Usage:
+#   snakemake --snakefile workflow/Snakefile \
+#     --configfile workflow/config_nanobody_metal_full.yaml \
+#     --config input_file=/path/to/receptor_with_ion.pdb \
+#              output_dir=/path/to/output \
+#              af3score_dir=/path/to/af3score af3_home=/path/to/af3 \
+#     -- target_nanobody_metal_full
+
+# --- Required ---
+input_file: "/path/to/receptor_with_ion.pdb"
+output_dir: "/path/to/output"
+
+# --- Pipeline mode ---
+mode: "nanobody_metal_full"
+
+# --- Metal ion settings ---
+ligandmpnn_dir: "/home/labs/schreiber/juliav/tools/PPIFlow/LigandMPNN"
+ion_names: "ZN MG FE CA MN CU ZN2"      # residue names to copy into backbone PDBs
+
+# --- Chain IDs ---
+antigen_chain: "C"
+heavy_chain: "A"
+
+# --- Framework ---
+# framework_pdb: "Framework/7xl0_nanobody_framework.pdb"  # default
+# cdr_length: "CDRH1,5-12,CDRH2,4-17,CDRH3,5-26"         # default
+
+# --- Round 1: De novo generation + LigandMPNN ---
+r1_samples_per_target: 100       # backbone samples
+n_gen_chunks: 1                  # parallel GPU jobs for generation
+r1_num_seq_per_target: 8         # LigandMPNN sequences per backbone
+r1_sampling_temp: "0.5"          # LigandMPNN temperature
+r1_iptm_threshold: 0.2           # AF3Score ipTM filter for R1
+
+# --- CDR interface ratio filtering ---
+cdr_interface_ratio_threshold: 0.6
+
+# --- Round 2: Partial flow refinement ---
+r2_start_t: 0.6                  # partial flow start_t (higher = more conservative)
+r2_samples_per_backbone: 8       # partial flow samples per enriched backbone
+r2_num_seq_per_target: 4         # LigandMPNN sequences per R2 backbone
+r2_sampling_temp: "0.1"          # LigandMPNN temperature
+r2_iptm_threshold: 0.3           # AF3Score ipTM filter for R2 (lowered from 0.5 for challenging ZN target)
+r2_ptm_threshold: 0.8            # AF3Score ptm_A filter for R2
+
+# --- FlowPacker (GPU sidechain packing, receives backbone-only PDBs) ---
+flowpacker_dir: "/home/labs/schreiber/juliav/tools/flowpacker"
+flowpacker_ckpt: "cluster.pth"
+
+# --- Enrichment ---
+energy_threshold: -5.0            # REU cutoff for key contact detection
+
+# --- Final ranking ---
+final_dockq_threshold: 0.49
+final_iptm_threshold: 0.7
+final_ptm_threshold: 0.8
+final_top_n: 30
+
+# --- Rosetta relax ---
+# relax_method: "interface"   # "interface" (fast, default) or "full"
+
+# --- AF3Score ---
+# af3score_dir: "/path/to/af3score"
+# af3score_num_jobs: 25
+
+# --- AF3 Refold ---
+# af3_home: "/path/to/af3"
+# af3_refold_seeds: 20

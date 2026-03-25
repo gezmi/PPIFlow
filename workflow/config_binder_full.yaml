@@ -1,0 +1,74 @@
+# PPIFlow Two-Round De Novo Binder Design Pipeline
+#
+# Two rounds: de novo binder generation → AF3Score filter → enrichment →
+#   partial flow refinement → final validation
+#
+# Binder R1 uses dual-strategy ProteinMPNN: 8 vanilla + 8 hydrophobic-biased
+# Binder R2 uses ProteinMPNN soluble checkpoint
+#
+# Usage:
+#   snakemake --snakefile workflow/Snakefile \
+#     --configfile workflow/config_binder_full.yaml \
+#     --config input_file=/path/to/receptor.pdb output_dir=/path/to/output \
+#       af3score_dir=/path/to/af3score af3_home=/path/to/af3 \
+#     target_binder_full
+
+# --- Required ---
+input_file: "/path/to/receptor.pdb"
+output_dir: "/path/to/output"
+
+# --- Pipeline mode ---
+mode: "binder_full"
+
+# --- Chain IDs ---
+antigen_chain: "C"
+
+# --- Binder size ---
+binder_min_length: 50
+binder_max_length: 100
+
+# --- Round 1: De novo generation + dual ProteinMPNN ---
+r1_samples_per_target: 100       # backbone samples (scale up to 25K for production)
+r1_num_seq_per_target: 8         # sequences per strategy (16 total: 8 vanilla + 8 biased)
+r1_sampling_temp: "0.2"          # ProteinMPNN temperature (paper B.1: 0.2)
+r1_iptm_threshold: 0.2           # AF3Score ipTM filter for R1
+
+# --- Round 2: Partial flow + ProteinMPNN soluble ---
+r2_start_t: 0.6                  # partial flow start_t
+r2_samples_per_backbone: 8       # partial flow samples per enriched backbone
+r2_num_seq_per_target: 4         # ProteinMPNN sequences per R2 backbone
+r2_sampling_temp: "0.1"          # ProteinMPNN temperature (paper: 0.1)
+r2_iptm_threshold: 0.5           # AF3Score ipTM filter for R2
+r2_ptm_threshold: 0.8            # AF3Score ptm_A filter for R2
+
+# --- CDR interface ratio filtering (after backbone generation) ---
+# cdr_interface_ratio_threshold: 0.6  # binder mode: disabled by default (no CDRs)
+
+# --- FlowPacker (GPU sidechain packing, replaces PyRosetta) ---
+flowpacker_dir: "/home/labs/schreiber/juliav/tools/flowpacker"
+flowpacker_ckpt: "cluster.pth"    # in {flowpacker_dir}/checkpoints/
+
+# --- Enrichment ---
+energy_threshold: -5.0            # REU cutoff for key contact detection
+
+# --- Hydrophobic bias for dual strategy ---
+# Bias 0.7 = ~2x more likely for F/M/W (light upweighting)
+hydrophobic_bias: {"F": 0.7, "M": 0.7, "W": 0.7}
+
+# --- Final ranking ---
+final_dockq_threshold: 0.49
+final_iptm_threshold: 0.7
+final_ptm_threshold: 0.8
+final_top_n: 30
+
+# --- Flexible target residues (optional) ---
+# flexible_target_residues: "C45,C50-55"  # Target residues to perturb
+# flexibility_sigma: 0.5                   # Noise magnitude (Angstroms)
+
+# --- AF3Score ---
+# af3score_dir: "/path/to/af3score"
+# af3score_num_jobs: 25
+
+# --- AF3 Refold ---
+# af3_home: "/path/to/af3"
+# af3_refold_seeds: 20

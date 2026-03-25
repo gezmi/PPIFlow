@@ -1,0 +1,2651 @@
+"""PPIFlow Snakemake Workflow
+
+Eight pipeline modes controlled by the target rule:
+  snakemake target_denovo               -- de novo nanobody design (single round)
+  snakemake target_affinity             -- affinity maturation (no AF3Score)
+  snakemake target_full                 -- affinity maturation with AF3Score filtering
+  snakemake target_rescore              -- rescore AF3 outputs (AF3Score + Rosetta relax)
+  snakemake target_nanobody_full        -- two-round de novo nanobody design (paper B.2)
+  snakemake target_binder_full          -- two-round de novo binder design (paper B.1)
+  snakemake target_nanobody_metal_full  -- two-round nanobody design, metal-ion-aware
+  snakemake target_binder_metal_full    -- two-round binder design, metal-ion-aware
+
+Fully automated: one command in, final ranking out.
+AF3 refolding is integrated via Snakemake checkpoint pattern.
+
+Minimal usage:
+  snakemake --snakefile workflow/Snakefile \
+    --configfile workflow/config_default.yaml \
+    --config input_file=/path/to/complex.cif output_dir=/path/to/output \
+      af3_home=/path/to/af3 \
+    target_affinity
+"""
+
+import json
+import os
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+PPIFLOW_ROOT = os.path.dirname(workflow.basedir)
+PYTHON = os.path.join(PPIFLOW_ROOT, "env", "bin", "python")
+
+# Ensure CUDA and conda env tools (hmmscan etc.) are available on cluster nodes
+ENV_BIN = os.path.join(PPIFLOW_ROOT, "env", "bin")
+shell.prefix(f"export CUDA_HOME=/apps/easybd/easybuild/amd/software/CUDA/12.1.1 PYTHONNOUSERSITE=1 PATH={ENV_BIN}:$PATH; ")
+
+# Required
+OUTDIR     = config["output_dir"]
+
+# Pipeline mode
+MODE = config.get("mode", "affinity")
+assert MODE in ("denovo", "affinity", "full", "rescore",
+                "nanobody_full", "binder_full",
+                "nanobody_metal_full", "binder_metal_full",
+                "binder_affinity"), \
+    (f"Invalid mode '{MODE}'. Must be one of: denovo, affinity, full, rescore, "
+     f"nanobody_full, binder_full, nanobody_metal_full, binder_metal_full, binder_affinity.")
+
+# Whether this is a metal-ion-aware two-round pipeline
+IS_METAL = MODE in ("nanobody_metal_full", "binder_metal_full")
+
+# input_file is required for all modes except rescore
+INPUT_FILE = config.get("input_file", "")
+if MODE != "rescore" and not INPUT_FILE:
+    raise ValueError("input_file is required for denovo/affinity/full modes")
+
+# Auto-derived defaults
+NAME       = config.get("name",
+                 os.path.splitext(os.path.basename(INPUT_FILE))[0] if INPUT_FILE else "rescore")
+INPUT_TYPE = config.get("input_type",
+                 ("cif" if INPUT_FILE.endswith(".cif") else "pdb") if INPUT_FILE else "pdb")
+
+# Chain IDs in the input file (affinity/full modes)
+NB_CHAIN  = config.get("nanobody_chain", "B")
+REC_CHAIN = config.get("receptor_chain", "A")
+
+# Design parameters
+ENERGY_THRESHOLD   = float(config.get("energy_threshold", -5.0))
+START_T            = float(config.get("start_t", 0.6))
+SAMPLES_PER_TARGET = int(config.get("samples_per_target", 8))
+NUM_SEQ_PER_TARGET = int(config.get("num_seq_per_target", 4))
+SAMPLING_TEMP      = float(config.get("sampling_temp", 0.1))
+
+# De novo mode parameters
+FRAMEWORK_PDB = config.get("framework_pdb",
+                    os.path.join(PPIFLOW_ROOT, "Framework",
+                                 "7xl0_nanobody_framework.pdb"))
+ANTIGEN_CHAIN = config.get("antigen_chain", "C")
+HEAVY_CHAIN   = config.get("heavy_chain", "A")
+CDR_LENGTH    = config.get("cdr_length", "CDRH1,5-12,CDRH2,4-17,CDRH3,5-26")
+HOTSPOTS      = config.get("specified_hotspots") or ""
+
+# Flexible target residues
+FLEX_TARGET_RESIDUES = config.get("flexible_target_residues", "")
+FLEXIBILITY_SIGMA    = float(config.get("flexibility_sigma", 0.0))
+FLEX_SIGMA           = float(config.get("flex_sigma", 0.0))
+FLEX_START_T         = float(config.get("flex_start_t", 0.0))
+
+# AF3Score (full and rescore pipelines)
+AF3SCORE_DIR       = config.get("af3score_dir", "")
+AF3SCORE_MODEL_DIR = config.get("af3score_model_dir",
+                         os.path.join(AF3SCORE_DIR, "params") if AF3SCORE_DIR else "")
+AF3SCORE_DB_DIR    = config.get("af3score_db_dir",
+                         os.path.join(AF3SCORE_DIR, "data") if AF3SCORE_DIR else "")
+AF3SCORE_NUM_JOBS  = int(config.get("af3score_num_jobs", 25))
+AF3SCORE_PYTHON    = os.path.join(AF3SCORE_DIR, "env", "bin", "python") if AF3SCORE_DIR else PYTHON
+
+# AF3 Refold
+AF3_HOME          = config.get("af3_home", "")
+AF3_REFOLD_SEEDS  = int(config.get("af3_refold_seeds", 20))
+AF3_MODEL_DIR     = config.get("af3_model_dir", "")
+
+# Two-round design parameters (nanobody_full, binder_full, and metal variants)
+if MODE in ("nanobody_full", "binder_full", "nanobody_metal_full", "binder_metal_full"):
+    DESIGN_TYPE       = "nanobody" if MODE in ("nanobody_full", "nanobody_metal_full") else "binder"
+    R1_SAMPLES        = int(config.get("r1_samples_per_target", 100))
+    N_GEN_CHUNKS      = int(config.get("n_gen_chunks", 1))
+    R1_NUM_SEQ        = int(config.get("r1_num_seq_per_target", 8))
+    R1_SAMPLING_TEMP  = config.get("r1_sampling_temp",
+                            "0.5" if DESIGN_TYPE == "nanobody" else "0.2")
+    R1_IPTM_THRESH    = float(config.get("r1_iptm_threshold", 0.2))
+    R2_START_T        = float(config.get("r2_start_t", 0.6))
+    R2_SAMPLES        = int(config.get("r2_samples_per_backbone", 8))
+    R2_NUM_SEQ        = int(config.get("r2_num_seq_per_target", 4))
+    R2_SAMPLING_TEMP  = config.get("r2_sampling_temp", "0.1")
+    R2_IPTM_THRESH    = float(config.get("r2_iptm_threshold", 0.5))
+    R2_PTM_THRESH     = float(config.get("r2_ptm_threshold", 0.8))
+    FINAL_DOCKQ       = float(config.get("final_dockq_threshold", 0.49))
+    FINAL_IPTM        = float(config.get("final_iptm_threshold", 0.7))
+    FINAL_PTM         = float(config.get("final_ptm_threshold", 0.8))
+    FINAL_TOP_N       = int(config.get("final_top_n", 30))
+    BINDER_MIN_LEN    = int(config.get("binder_min_length", 50))
+    BINDER_MAX_LEN    = int(config.get("binder_max_length", 100))
+    HYDRO_BIAS        = json.dumps(
+        config.get("hydrophobic_bias", {"F": 0.7, "M": 0.7, "W": 0.7}))
+    # FlowPacker (replaces PyRosetta sidechain packing)
+    FLOWPACKER_DIR    = config.get("flowpacker_dir", "")
+    FLOWPACKER_CKPT   = config.get("flowpacker_ckpt", "cluster.pth")
+    CDR_RATIO_THRESH  = float(config.get(
+        "cdr_interface_ratio_threshold", 0.6))
+    # Rosetta relax method
+    RELAX_METHOD      = config.get("relax_method", "interface")
+    # LigandMPNN (metal mode only)
+    LIGANDMPNN_DIR    = config.get("ligandmpnn_dir", "")
+    ION_NAMES         = config.get("ion_names", "ZN MG FE CA MN CU ZN2")
+    if IS_METAL and not LIGANDMPNN_DIR:
+        raise ValueError("Metal mode requires 'ligandmpnn_dir' in config.")
+
+# ---------------------------------------------------------------------------
+# Derived paths (mode-dependent numbering)
+# ---------------------------------------------------------------------------
+INPUT_PDB = os.path.join(OUTDIR, "00_input", f"{NAME}.pdb")
+
+if MODE == "denovo":
+    # denovo: 00_input → 01_denovo → 02_cdr_analysis → 03_abmpnn →
+    #         04_sidechain_packing → 05_rosetta_relax →
+    #         05_af3_refold → 06_dockq → final_ranking.csv
+    BACKBONE_DIR    = os.path.join(OUTDIR, "01_denovo")
+    CDR_DIR         = os.path.join(OUTDIR, "02_cdr_analysis")
+    ABMPNN_DIR      = os.path.join(OUTDIR, "03_abmpnn")
+    PACKED_DIR      = os.path.join(OUTDIR, "04_sidechain_packing")
+    RELAX_DIR       = os.path.join(OUTDIR, "05_rosetta_relax")
+    AF3_REFOLD_DIR  = os.path.join(OUTDIR, "05_af3_refold")
+    DOCKQ_DIR       = os.path.join(OUTDIR, "06_dockq")
+elif MODE == "affinity":
+    # affinity: 00_input → 01_interface_energy → 02_cdr_analysis →
+    #           03_partial_flow → 04_abmpnn → 05_sidechain_packing →
+    #           06_rosetta_relax → 07_af3_refold → 08_dockq →
+    #           final_ranking.csv
+    ENERGY_DIR      = os.path.join(OUTDIR, "01_rosetta_interface")
+    CDR_DIR         = os.path.join(OUTDIR, "02_cdr_analysis")
+    BACKBONE_DIR    = os.path.join(OUTDIR, "03_partial_flow")
+    ABMPNN_DIR      = os.path.join(OUTDIR, "04_abmpnn")
+    PACKED_DIR      = os.path.join(OUTDIR, "05_sidechain_packing")
+    RELAX_DIR       = os.path.join(OUTDIR, "06_rosetta_relax")
+    AF3_REFOLD_DIR  = os.path.join(OUTDIR, "07_af3_refold")
+    DOCKQ_DIR       = os.path.join(OUTDIR, "08_dockq")
+elif MODE == "full":
+    # full: same as affinity but with AF3Score after sidechain_packing
+    ENERGY_DIR      = os.path.join(OUTDIR, "01_rosetta_interface")
+    CDR_DIR         = os.path.join(OUTDIR, "02_cdr_analysis")
+    BACKBONE_DIR    = os.path.join(OUTDIR, "03_partial_flow")
+    ABMPNN_DIR      = os.path.join(OUTDIR, "04_abmpnn")
+    PACKED_DIR      = os.path.join(OUTDIR, "05_sidechain_packing")
+    AF3SCORE_OUTDIR = os.path.join(OUTDIR, "06_af3score")
+    RELAX_DIR       = os.path.join(OUTDIR, "07_rosetta_relax")
+    AF3_REFOLD_DIR  = os.path.join(OUTDIR, "08_af3_refold")
+    DOCKQ_DIR       = os.path.join(OUTDIR, "09_dockq")
+
+elif MODE == "binder_affinity":
+    # binder_affinity: 00_input → 01_rosetta_interface →
+    #                  02_partial_flow → 03_seqdesign →
+    #                  04_sidechain_packing → 05_af3score →
+    #                  06_rosetta_relax → 07_af3_refold → 08_dockq →
+    #                  final_ranking.csv
+    ENERGY_DIR      = os.path.join(OUTDIR, "01_rosetta_interface")
+    BACKBONE_DIR    = os.path.join(OUTDIR, "02_partial_flow")
+    ABMPNN_DIR      = os.path.join(OUTDIR, "03_seqdesign")
+    PACKED_DIR      = os.path.join(OUTDIR, "04_sidechain_packing")
+    AF3SCORE_OUTDIR = os.path.join(OUTDIR, "05_af3score")
+    RELAX_DIR       = os.path.join(OUTDIR, "06_rosetta_relax")
+    AF3_REFOLD_DIR  = os.path.join(OUTDIR, "07_af3_refold")
+    DOCKQ_DIR       = os.path.join(OUTDIR, "08_dockq")
+
+elif MODE in ("nanobody_full", "binder_full", "nanobody_metal_full", "binder_metal_full"):
+    # Two-round: 00_input → 01_denovo → 01b_filtered → ... → 14_dockq → final_ranking.csv
+    DN2_GEN_DIR         = os.path.join(OUTDIR, "01_denovo")
+    DN2_FILTER_DIR      = os.path.join(OUTDIR, "01b_filtered_backbones")
+    DN2_POS_R1_DIR      = os.path.join(OUTDIR, "02_position_analysis_r1")
+    DN2_SEQ_R1_DIR      = os.path.join(OUTDIR, "03_seqdesign_r1")
+    DN2_PACK_R1_DIR     = os.path.join(OUTDIR, "04_sidechain_packing_r1")
+    DN2_AF3S_R1_DIR     = os.path.join(OUTDIR, "05_af3score_r1")
+    DN2_ENRICH_DIR      = os.path.join(OUTDIR, "06_enrichment")
+    DN2_PFLOW_DIR       = os.path.join(OUTDIR, "07_partial_flow")
+    DN2_POS_R2_DIR      = os.path.join(OUTDIR, "08_position_analysis_r2")
+    DN2_SEQ_R2_DIR      = os.path.join(OUTDIR, "09_seqdesign_r2")
+    DN2_PACK_R2_DIR     = os.path.join(OUTDIR, "10_sidechain_packing_r2")
+    DN2_AF3S_R2_DIR     = os.path.join(OUTDIR, "11_af3score_r2")
+    DN2_RELAX_DIR       = os.path.join(OUTDIR, "12_rosetta_relax")
+    DN2_AF3_REFOLD_DIR  = os.path.join(OUTDIR, "13_af3_refold")
+    DN2_DOCKQ_DIR       = os.path.join(OUTDIR, "14_dockq")
+    # Metal mode: ion-copy dirs for LigandMPNN and AF3Score
+    if IS_METAL:
+        DN2_FILTER_IONS_DIR  = os.path.join(OUTDIR, "01c_filtered_backbones_ions")
+        DN2_PACK_R1_IONS_DIR = os.path.join(OUTDIR, "04b_sidechain_packing_r1_ions")
+        DN2_PFLOW_IONS_DIR   = os.path.join(OUTDIR, "07b_partial_flow_ions")
+        DN2_PACK_R2_IONS_DIR = os.path.join(OUTDIR, "10b_sidechain_packing_r2_ions")
+
+else:  # rescore
+    # rescore: CIF→PDB → AF3Score + Rosetta relax → ranking
+    RESCORE_INPUT_DIR = config["input_dir"]
+    RESCORE_SAMPLE    = config.get("rescore_samples", "top")
+    RESCORE_PDB_DIR   = os.path.join(OUTDIR, "00_pdbs")
+    AF3SCORE_OUTDIR   = os.path.join(OUTDIR, "01_af3score")
+    RELAX_DIR         = os.path.join(OUTDIR, "02_rosetta_relax")
+
+# ===================================================================
+# Target rules
+# ===================================================================
+
+rule target_denovo:
+    """De novo nanobody design → AF3 refold → ranked designs."""
+    input:
+        os.path.join(OUTDIR, "final_ranking.csv")
+
+rule target_affinity:
+    """Affinity maturation → AF3 refold → ranked designs."""
+    input:
+        os.path.join(OUTDIR, "final_ranking.csv")
+
+rule target_full:
+    """Full pipeline with AF3Score → AF3 refold → ranked designs."""
+    input:
+        os.path.join(OUTDIR, "final_ranking.csv")
+
+rule target_rescore:
+    """Rescore AF3 outputs: AF3Score + Rosetta relax → ranked CSV."""
+    input:
+        os.path.join(OUTDIR, "rescore_ranking.csv")
+
+rule target_binder_affinity:
+    """Binder affinity maturation with AF3Score → ranked designs."""
+    input:
+        os.path.join(OUTDIR, "final_ranking.csv")
+
+rule target_nanobody_full:
+    """Two-round de novo nanobody design pipeline."""
+    input:
+        os.path.join(OUTDIR, "final_ranking.csv")
+
+rule target_binder_full:
+    """Two-round de novo binder design pipeline."""
+    input:
+        os.path.join(OUTDIR, "final_ranking.csv")
+
+rule target_nanobody_metal_full:
+    """Two-round de novo nanobody design pipeline (metal-ion-aware)."""
+    input:
+        os.path.join(OUTDIR, "final_ranking.csv")
+
+rule target_binder_metal_full:
+    """Two-round de novo binder design pipeline (metal-ion-aware)."""
+    input:
+        os.path.join(OUTDIR, "final_ranking.csv")
+
+# ===================================================================
+# Mode-specific rules: de novo
+# ===================================================================
+
+if MODE == "denovo":
+    rule prepare_receptor:
+        """Step 0: Copy or rename receptor PDB (ensure antigen is chain C)."""
+        input:
+            raw=INPUT_FILE
+        output:
+            pdb=INPUT_PDB
+        run:
+            os.makedirs(os.path.dirname(output.pdb), exist_ok=True)
+            if INPUT_TYPE == "cif":
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/step01_cif_to_pdb.py "
+                    f"--input_cif {input.raw} --output_pdb {output.pdb} "
+                    f"--nanobody_chain _ --receptor_chain {ANTIGEN_CHAIN}"
+                )
+            else:
+                # Rename receptor chain to ANTIGEN_CHAIN (default C) to avoid
+                # collision with framework chain A
+                with open(input.raw) as fin, open(output.pdb, "w") as fout:
+                    for line in fin:
+                        if line.startswith(("ATOM", "HETATM")):
+                            line = line[:21] + ANTIGEN_CHAIN + line[22:]
+                        fout.write(line)
+
+    rule denovo_generation:
+        """Step 1: De novo nanobody CDR generation [GPU]."""
+        input:
+            antigen=INPUT_PDB
+        output:
+            done=touch(os.path.join(BACKBONE_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/sample_antibody_nanobody.py "
+            "--antigen_pdb {input.antigen} --antigen_chain {ANTIGEN_CHAIN} "
+            "--framework_pdb {FRAMEWORK_PDB} --heavy_chain {HEAVY_CHAIN} "
+            "--cdr_length '{CDR_LENGTH}' "
+            "--specified_hotspots '{HOTSPOTS}' "
+            "--config {PPIFLOW_ROOT}/configs/inference_nanobody.yaml "
+            "--samples_per_target {SAMPLES_PER_TARGET} "
+            "--model_weights {PPIFLOW_ROOT}/checkpoints/nanobody.ckpt "
+            "--flexible_target_residues '{FLEX_TARGET_RESIDUES}' "
+            "--flexibility_sigma {FLEXIBILITY_SIGMA} "
+            "--flex_sigma {FLEX_SIGMA} --flex_start_t {FLEX_START_T} "
+            "--output_dir {BACKBONE_DIR} --name {NAME}"
+
+    rule cdr_analysis_denovo:
+        """Step 2: CDR analysis for de novo designs (framework indices only)."""
+        input:
+            backbone_done=os.path.join(BACKBONE_DIR, ".done")
+        output:
+            fixed_json=os.path.join(CDR_DIR, "fixed_positions.json"),
+            cdr_csv=os.path.join(CDR_DIR, "cdr_idx.csv")
+        resources:
+            mem_mb=4000
+        run:
+            import pandas as pd
+
+            os.makedirs(CDR_DIR, exist_ok=True)
+
+            # Extract CDR positions from generated structures
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/get_cdr.py "
+                f"{BACKBONE_DIR} {output.cdr_csv}"
+            )
+
+            # Framework indices from CDR CSV (no energy-based key contacts)
+            fw_indices = []
+            cdr_positions = ""
+            if os.path.exists(output.cdr_csv):
+                df = pd.read_csv(output.cdr_csv)
+                if not df.empty:
+                    r = df.iloc[0]
+                    fw_str = str(r.get("fw_index", ""))
+                    fw_indices = fw_str.split() if fw_str else []
+                    cdr_positions = str(r.get("r2_cdr_pos", ""))
+
+            fw_nums = sorted({int("".join(c for c in i if c.isdigit()))
+                             for i in fw_indices if any(c.isdigit() for c in i)})
+
+            fixed_data = {
+                "key_contact_residues": [],
+                "partial_flow_fixed": "",
+                "cdr_positions": cdr_positions,
+                "hotspots": HOTSPOTS,
+                "abmpnn_fw_and_key_fixed": " ".join(str(x) for x in fw_nums),
+                "fw_indices": fw_indices,
+                "key_res_nums": [],
+            }
+            with open(output.fixed_json, "w") as f:
+                json.dump(fixed_data, f, indent=2)
+
+# ===================================================================
+# Mode-specific rules: affinity / full (shared initial steps)
+# ===================================================================
+
+if MODE in ("affinity", "full", "binder_affinity"):
+    rule prepare_input:
+        """Step 0: Convert CIF to PDB or rename PDB chains (nanobody→A, receptor→C)."""
+        input:
+            raw=INPUT_FILE
+        output:
+            pdb=INPUT_PDB
+        run:
+            os.makedirs(os.path.dirname(output.pdb), exist_ok=True)
+            if INPUT_TYPE == "cif":
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/step01_cif_to_pdb.py "
+                    f"--input_cif {input.raw} --output_pdb {output.pdb} "
+                    f"--nanobody_chain {NB_CHAIN} --receptor_chain {REC_CHAIN}"
+                )
+            elif NB_CHAIN == "A" and REC_CHAIN == "C":
+                import shutil
+                shutil.copy2(input.raw, output.pdb)
+            else:
+                import sys
+                sys.path.insert(0, os.path.join(PPIFLOW_ROOT, "pipeline_scripts"))
+                from pipeline_common import _rename_pdb_chains
+                _rename_pdb_chains(input.raw, output.pdb, NB_CHAIN, REC_CHAIN)
+
+    rule interface_energy:
+        """Step 1: Per-residue interface energy analysis (PyRosetta)."""
+        input:
+            pdb=INPUT_PDB
+        output:
+            energy_csv=os.path.join(ENERGY_DIR, "residue_energy.csv"),
+            hotspots=os.path.join(ENERGY_DIR, "hotspots.txt")
+        resources:
+            mem_mb=8000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/step02_interface_energy.py "
+            "--input_pdb {input.pdb} "
+            "--output_dir {ENERGY_DIR} "
+            "--binder_chain A --target_chain C "
+            "--distance_cutoff 10.0"
+
+if MODE in ("affinity", "full"):
+    rule cdr_analysis:
+        """Step 2: CDR extraction and fixed position computation."""
+        input:
+            pdb=INPUT_PDB,
+            energy_csv=os.path.join(ENERGY_DIR, "residue_energy.csv"),
+            hotspots=os.path.join(ENERGY_DIR, "hotspots.txt")
+        output:
+            fixed_json=os.path.join(CDR_DIR, "fixed_positions.json"),
+            cdr_csv=os.path.join(CDR_DIR, "cdr_idx.csv")
+        resources:
+            mem_mb=4000
+        run:
+            import csv as csv_mod
+            import pandas as pd
+
+            os.makedirs(CDR_DIR, exist_ok=True)
+            input_dir = os.path.dirname(input.pdb)
+
+            # Extract CDR positions
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/get_cdr.py "
+                f"{input_dir} {output.cdr_csv}"
+            )
+
+            # Key contact residues from energy analysis
+            key_residues = []
+            with open(input.energy_csv) as f:
+                reader = csv_mod.DictReader(f)
+                for row in reader:
+                    if float(row["binder_energy"]) < ENERGY_THRESHOLD:
+                        key_residues.append(row["residue"])
+
+            # Framework indices from CDR CSV
+            fw_indices, cdr_positions = [], ""
+            if os.path.exists(output.cdr_csv):
+                df = pd.read_csv(output.cdr_csv)
+                if not df.empty:
+                    r = df.iloc[0]
+                    fw_str = str(r.get("fw_index", ""))
+                    fw_indices = fw_str.split() if fw_str else []
+                    cdr_positions = str(r.get("r2_cdr_pos", ""))
+
+            # Read hotspots
+            with open(input.hotspots) as f:
+                hotspots_str = f.read().strip()
+
+            # Compute fixed positions
+            partial_flow_fixed = ",".join(key_residues)
+            key_nums = sorted({int("".join(c for c in r if c.isdigit()))
+                              for r in key_residues if any(c.isdigit() for c in r)})
+            fw_nums = sorted({int("".join(c for c in i if c.isdigit()))
+                             for i in fw_indices if any(c.isdigit() for c in i)})
+            abmpnn_fixed = sorted(set(fw_nums) | set(key_nums))
+
+            fixed_data = {
+                "key_contact_residues": key_residues,
+                "partial_flow_fixed": partial_flow_fixed,
+                "cdr_positions": cdr_positions,
+                "hotspots": hotspots_str,
+                "abmpnn_fw_and_key_fixed": " ".join(str(x) for x in abmpnn_fixed),
+                "fw_indices": fw_indices,
+                "key_res_nums": list(key_nums),
+            }
+            with open(output.fixed_json, "w") as f:
+                json.dump(fixed_data, f, indent=2)
+
+    rule partial_flow:
+        """Step 3: Partial flow backbone generation (GPU)."""
+        input:
+            pdb=INPUT_PDB,
+            fixed_json=os.path.join(CDR_DIR, "fixed_positions.json")
+        output:
+            done=touch(os.path.join(BACKBONE_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            with open(input.fixed_json) as f:
+                d = json.load(f)
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/sample_antibody_nanobody_partial.py "
+                f"--complex_pdb {input.pdb} "
+                f"--start_t {START_T} "
+                f'--fixed_positions "{d["partial_flow_fixed"]}" '
+                f"--antigen_chain C --heavy_chain A "
+                f"--config {PPIFLOW_ROOT}/configs/inference_nanobody.yaml "
+                f"--samples_per_target {SAMPLES_PER_TARGET} "
+                f'--cdr_position "{d["cdr_positions"]}" '
+                f'--specified_hotspots "{d["hotspots"]}" '
+                f"--retry_Limit 10 "
+                f"--model_weights {PPIFLOW_ROOT}/checkpoints/nanobody.ckpt "
+                f"--flexible_target_residues '{FLEX_TARGET_RESIDUES}' "
+                f"--flexibility_sigma {FLEXIBILITY_SIGMA} "
+                f"--flex_sigma {FLEX_SIGMA} --flex_start_t {FLEX_START_T} "
+                f"--output_dir {BACKBONE_DIR} "
+                f"--name {NAME}"
+            )
+
+# ===================================================================
+# AF3Score rules (full pipeline only)
+# ===================================================================
+
+# AF3Score filter thresholds — ptm_A defaults to 0 in binder_affinity because
+# chain A is the target (short peptide), not the designed chain.
+IPTM_THRESH  = float(config.get("iptm_threshold", 0.5))
+PTM_A_THRESH = float(config.get("ptm_a_threshold",
+                                 0.0 if MODE == "binder_affinity" else 0.8))
+
+if MODE in ("full", "binder_affinity"):
+    checkpoint af3score_prepare:
+        """Prepare AF3Score JSON inputs and batches."""
+        input:
+            packed_done=os.path.join(PACKED_DIR, ".done")
+        output:
+            done=touch(os.path.join(AF3SCORE_OUTDIR, "batch", ".prepared"))
+        resources:
+            mem_mb=8000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "mkdir -p {AF3SCORE_OUTDIR}/json {AF3SCORE_OUTDIR}/batch && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/4.1-prepare_get_json.py "
+            "--input_dir {PACKED_DIR} "
+            "--output_dir_cif {AF3SCORE_OUTDIR}/single_chain_cif "
+            "--save_csv {AF3SCORE_OUTDIR}/seq.csv "
+            "--output_dir_json {AF3SCORE_OUTDIR}/json "
+            "--batch_dir {AF3SCORE_OUTDIR}/batch "
+            "--num_jobs {AF3SCORE_NUM_JOBS}"
+
+    rule af3score_jax_batch:
+        """Convert PDBs to JAX h5 format for one AF3Score batch (CPU)."""
+        input:
+            prepared=os.path.join(AF3SCORE_OUTDIR, "batch", ".prepared"),
+            batch_json=os.path.join(AF3SCORE_OUTDIR, "batch", "json", "{batch_name}")
+        output:
+            done=touch(os.path.join(AF3SCORE_OUTDIR, "batch", "h5", "{batch_name}", ".done"))
+        resources:
+            mem_mb=16000
+        shell:
+            """
+            eval "$('/apps/easybd/programs/miniconda/24.11_environmentally/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+            conda activate {AF3SCORE_DIR}/env
+            export JAX_PLATFORM_NAME=cpu
+            cd {PPIFLOW_ROOT}
+            mkdir -p "{AF3SCORE_OUTDIR}/batch/h5/{wildcards.batch_name}"
+            {AF3SCORE_PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/4.2_prepare_pdb2jax.py \
+                --pdb_folder "{AF3SCORE_OUTDIR}/batch/pdb/{wildcards.batch_name}" \
+                --output_folder "{AF3SCORE_OUTDIR}/batch/h5/{wildcards.batch_name}"
+            """
+
+    rule af3score_inference_batch:
+        """Run AF3Score inference on one batch [GPU]."""
+        input:
+            jax_done=os.path.join(AF3SCORE_OUTDIR, "batch", "h5", "{batch_name}", ".done")
+        output:
+            done=touch(os.path.join(AF3SCORE_OUTDIR, "af3score_output", "{batch_name}", ".done"))
+        resources:
+            mem_mb=32000,
+            gpu=1
+        shell:
+            """
+            eval "$('/apps/easybd/programs/miniconda/24.11_environmentally/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+            conda activate {AF3SCORE_DIR}/env
+            export CUDA_HOME=/apps/easybd/easybuild/amd/software/CUDA/12.4.0
+            export PATH=$CUDA_HOME/bin:$PATH
+            cd {PPIFLOW_ROOT}
+            export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false --xla_gpu_graph_level=0"
+            export XLA_PYTHON_CLIENT_PREALLOCATE=true
+            export XLA_CLIENT_MEM_FRACTION=0.90
+
+            mkdir -p "{AF3SCORE_OUTDIR}/af3score_output/{wildcards.batch_name}"
+            {AF3SCORE_PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/run_af3score.py \
+                --db_dir={AF3SCORE_DB_DIR} \
+                --model_dir={AF3SCORE_MODEL_DIR} \
+                --batch_json_dir="{AF3SCORE_OUTDIR}/batch/json/{wildcards.batch_name}" \
+                --batch_h5_dir="{AF3SCORE_OUTDIR}/batch/h5/{wildcards.batch_name}" \
+                --output_dir="{AF3SCORE_OUTDIR}/af3score_output/{wildcards.batch_name}" \
+                --run_data_pipeline=False \
+                --run_inference=true \
+                --init_guess=true \
+                --num_samples=1 \
+                --write_summary_confidences=true \
+                --write_full_confidences=true
+            """
+
+    def get_af3score_batches(wildcards):
+        """Discover batch dirs from checkpoint output and request all inference jobs."""
+        checkpoints.af3score_prepare.get(**wildcards)
+        batch_json = os.path.join(AF3SCORE_OUTDIR, "batch", "json")
+        batches = sorted([d for d in os.listdir(batch_json)
+                          if d.startswith("batch_")])
+        return expand(os.path.join(AF3SCORE_OUTDIR, "af3score_output", "{b}", ".done"),
+                       b=batches)
+
+    rule af3score_metrics:
+        """Extract metrics from AF3Score output."""
+        input:
+            get_af3score_batches
+        output:
+            csv=os.path.join(AF3SCORE_OUTDIR, "af3score_results.csv")
+        resources:
+            mem_mb=4000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/easy_get_metrics.py "
+            "{AF3SCORE_OUTDIR}/af3score_output "
+            "{output.csv}"
+
+    rule af3score_filter:
+        """Filter designs by AF3Score metrics (iptm > threshold, optionally ptm_A > threshold)."""
+        input:
+            csv=os.path.join(AF3SCORE_OUTDIR, "af3score_results.csv"),
+            packed_done=os.path.join(PACKED_DIR, ".done")
+        output:
+            done=touch(os.path.join(AF3SCORE_OUTDIR, "filtered_links", ".done"))
+        run:
+            import pandas as pd
+            import shutil
+
+            df = pd.read_csv(input.csv)
+            if PTM_A_THRESH > 0:
+                passed = df[(df["iptm"] > IPTM_THRESH) & (df["ptm_A"] > PTM_A_THRESH)]
+            else:
+                passed = df[df["iptm"] > IPTM_THRESH]
+
+            out_dir = os.path.join(AF3SCORE_OUTDIR, "filtered_links")
+            os.makedirs(out_dir, exist_ok=True)
+            for _, row in passed.iterrows():
+                src = os.path.join(PACKED_DIR, row["description"] + ".pdb")
+                if os.path.exists(src):
+                    shutil.copy(src, out_dir)
+            passed.to_csv(os.path.join(AF3SCORE_OUTDIR, "filtered_results.csv"),
+                           index=False)
+            print(f"{len(passed)}/{len(df)} designs passed AF3Score filter "
+                  f"(iptm>{IPTM_THRESH}"
+                  + (f", ptm_A>{PTM_A_THRESH}" if PTM_A_THRESH > 0 else "")
+                  + ")")
+
+# ===================================================================
+# Rescore mode rules
+# ===================================================================
+
+if MODE == "rescore":
+    rule convert_cifs:
+        """Convert AF3 CIF outputs to flat PDB directory."""
+        output:
+            done=touch(os.path.join(RESCORE_PDB_DIR, ".done"))
+        resources:
+            mem_mb=8000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/convert_cif_flat.py "
+            "--input_dir {RESCORE_INPUT_DIR} --output_dir {RESCORE_PDB_DIR} "
+            "--sample {RESCORE_SAMPLE}"
+
+    checkpoint rescore_af3score_prepare:
+        """Prepare AF3Score JSON inputs and batches for rescoring."""
+        input:
+            pdb_done=os.path.join(RESCORE_PDB_DIR, ".done")
+        output:
+            done=touch(os.path.join(AF3SCORE_OUTDIR, "batch", ".prepared"))
+        resources:
+            mem_mb=8000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "mkdir -p {AF3SCORE_OUTDIR}/json {AF3SCORE_OUTDIR}/batch && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/4.1-prepare_get_json.py "
+            "--input_dir {RESCORE_PDB_DIR} "
+            "--output_dir_cif {AF3SCORE_OUTDIR}/single_chain_cif "
+            "--save_csv {AF3SCORE_OUTDIR}/seq.csv "
+            "--output_dir_json {AF3SCORE_OUTDIR}/json "
+            "--batch_dir {AF3SCORE_OUTDIR}/batch "
+            "--num_jobs {AF3SCORE_NUM_JOBS}"
+
+    rule rescore_af3score_jax_batch:
+        """Convert PDBs to JAX h5 format for one AF3Score batch (CPU)."""
+        input:
+            prepared=os.path.join(AF3SCORE_OUTDIR, "batch", ".prepared"),
+            batch_json=os.path.join(AF3SCORE_OUTDIR, "batch", "json", "{batch_name}")
+        output:
+            done=touch(os.path.join(AF3SCORE_OUTDIR, "batch", "h5", "{batch_name}", ".done"))
+        resources:
+            mem_mb=16000
+        shell:
+            """
+            eval "$('/apps/easybd/programs/miniconda/24.11_environmentally/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+            conda activate {AF3SCORE_DIR}/env
+            export JAX_PLATFORM_NAME=cpu
+            cd {PPIFLOW_ROOT}
+            mkdir -p "{AF3SCORE_OUTDIR}/batch/h5/{wildcards.batch_name}"
+            {AF3SCORE_PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/4.2_prepare_pdb2jax.py \
+                --pdb_folder "{AF3SCORE_OUTDIR}/batch/pdb/{wildcards.batch_name}" \
+                --output_folder "{AF3SCORE_OUTDIR}/batch/h5/{wildcards.batch_name}"
+            """
+
+    rule rescore_af3score_inference_batch:
+        """Run AF3Score inference on one batch [GPU]."""
+        input:
+            jax_done=os.path.join(AF3SCORE_OUTDIR, "batch", "h5", "{batch_name}", ".done")
+        output:
+            done=touch(os.path.join(AF3SCORE_OUTDIR, "af3score_output", "{batch_name}", ".done"))
+        resources:
+            mem_mb=32000,
+            gpu=1
+        shell:
+            """
+            eval "$('/apps/easybd/programs/miniconda/24.11_environmentally/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+            conda activate {AF3SCORE_DIR}/env
+            export CUDA_HOME=/apps/easybd/easybuild/amd/software/CUDA/12.4.0
+            export PATH=$CUDA_HOME/bin:$PATH
+            cd {PPIFLOW_ROOT}
+            export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false --xla_gpu_graph_level=0"
+            export XLA_PYTHON_CLIENT_PREALLOCATE=true
+            export XLA_CLIENT_MEM_FRACTION=0.90
+
+            mkdir -p "{AF3SCORE_OUTDIR}/af3score_output/{wildcards.batch_name}"
+            {AF3SCORE_PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/run_af3score.py \
+                --db_dir={AF3SCORE_DB_DIR} \
+                --model_dir={AF3SCORE_MODEL_DIR} \
+                --batch_json_dir="{AF3SCORE_OUTDIR}/batch/json/{wildcards.batch_name}" \
+                --batch_h5_dir="{AF3SCORE_OUTDIR}/batch/h5/{wildcards.batch_name}" \
+                --output_dir="{AF3SCORE_OUTDIR}/af3score_output/{wildcards.batch_name}" \
+                --run_data_pipeline=False \
+                --run_inference=true \
+                --init_guess=true \
+                --num_samples=1 \
+                --write_summary_confidences=true \
+                --write_full_confidences=true
+            """
+
+    def get_rescore_af3score_batches(wildcards):
+        """Discover batch dirs from checkpoint output and request all inference jobs."""
+        checkpoints.rescore_af3score_prepare.get(**wildcards)
+        batch_json = os.path.join(AF3SCORE_OUTDIR, "batch", "json")
+        batches = sorted([d for d in os.listdir(batch_json)
+                          if d.startswith("batch_")])
+        return expand(os.path.join(AF3SCORE_OUTDIR, "af3score_output", "{b}", ".done"),
+                       b=batches)
+
+    rule rescore_af3score_metrics:
+        """Extract metrics from AF3Score output."""
+        input:
+            get_rescore_af3score_batches
+        output:
+            csv=os.path.join(AF3SCORE_OUTDIR, "af3score_results.csv")
+        resources:
+            mem_mb=4000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/easy_get_metrics.py "
+            "{AF3SCORE_OUTDIR}/af3score_output "
+            "{output.csv}"
+
+    rule rescore_relax:
+        """Interface-focused Rosetta relax on converted PDBs (CPU-parallel)."""
+        input:
+            pdb_done=os.path.join(RESCORE_PDB_DIR, ".done")
+        output:
+            done=touch(os.path.join(RELAX_DIR, ".done"))
+        threads: 20
+        resources:
+            mem_mb=40000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/relax_interface.py "
+            "--pdb_dir {RESCORE_PDB_DIR} --output_dir {RELAX_DIR} "
+            "--batch_idx 0 --dump_pdb True --num_workers 20"
+
+    rule rescore_ranking:
+        """Rank by AF3Score + interface score (no DockQ)."""
+        input:
+            af3score_csv=os.path.join(AF3SCORE_OUTDIR, "af3score_results.csv"),
+            relax_done=os.path.join(RELAX_DIR, ".done")
+        output:
+            csv=os.path.join(OUTDIR, "rescore_ranking.csv")
+        run:
+            import pandas as pd
+            import glob as glob_mod
+
+            df_af3 = pd.read_csv(input.af3score_csv)
+
+            relax_csvs = glob_mod.glob(os.path.join(RELAX_DIR, "rosetta_complex_*.csv"))
+            df_relax = pd.concat([pd.read_csv(f) for f in relax_csvs])
+
+            df = df_af3.merge(
+                df_relax[["pdb_name", "interface_score"]],
+                left_on="description", right_on="pdb_name", how="left"
+            )
+
+            df["score"] = df["iptm"] * 100 - df["interface_score"]
+            df = df.sort_values("score", ascending=False)
+
+            df.to_csv(output.csv, index=False)
+            print(f"{len(df)} designs scored and ranked")
+            if not df.empty:
+                print("\nTop designs:")
+                print(df[["description", "iptm", "ptm_A",
+                          "interface_score", "score"]].head(10).to_string(
+                              index=False))
+
+# ===================================================================
+# Shared design rules: AbMPNN, sidechain packing
+# (not used in rescore mode)
+# ===================================================================
+
+if MODE not in ("rescore", "nanobody_full", "binder_full",
+                "nanobody_metal_full", "binder_metal_full",
+                "binder_affinity"):
+    rule abmpnn:
+        """AbMPNN sequence redesign (GPU)."""
+        input:
+            backbone_done=os.path.join(BACKBONE_DIR, ".done")
+        output:
+            done=touch(os.path.join(ABMPNN_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            os.makedirs(ABMPNN_DIR, exist_ok=True)
+
+            # Extract fixed positions from b-factors in generated PDBs
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/make_fix_csv.py "
+                f"{BACKBONE_DIR}"
+            )
+            fixpos_csv = os.path.join(BACKBONE_DIR, "fixed_positions.csv")
+            import shutil
+            shutil.copy(fixpos_csv, os.path.join(ABMPNN_DIR, "fixed_positions.csv"))
+
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/ProteinMPNN/protein_mpnn_run.py "
+                f'--path_to_model_weights "{PPIFLOW_ROOT}/ProteinMPNN/model_weights/" '
+                f'--model_name "abmpnn" '
+                f'--folder_with_pdbs_path "{BACKBONE_DIR}" '
+                f'--out_folder "{ABMPNN_DIR}" '
+                f'--chain_list "A" '
+                f'--position_list "{fixpos_csv}" '
+                f"--num_seq_per_target {NUM_SEQ_PER_TARGET} "
+                f"--sampling_temp {SAMPLING_TEMP} "
+                f"--seed 37 "
+                f"--batch_size {NUM_SEQ_PER_TARGET} "
+                f"--omit_AAs C"
+            )
+
+if MODE not in ("rescore", "nanobody_full", "binder_full",
+                "nanobody_metal_full", "binder_metal_full"):
+    rule sidechain_packing:
+        """Thread sequences and repack sidechains (PyRosetta)."""
+        input:
+            backbone_done=os.path.join(BACKBONE_DIR, ".done"),
+            abmpnn_done=os.path.join(ABMPNN_DIR, ".done")
+        output:
+            done=touch(os.path.join(PACKED_DIR, ".done"))
+        threads: 4
+        resources:
+            mem_mb=16000
+        run:
+            import glob as glob_mod
+            os.makedirs(PACKED_DIR, exist_ok=True)
+            # binder_affinity: PDBs written to a subdir by sample_binder_partial.py
+            if MODE == "binder_affinity":
+                pdb_files = sorted(glob_mod.glob(
+                    os.path.join(BACKBONE_DIR, "**", "*.pdb"), recursive=True))
+                backbone_dir = os.path.dirname(pdb_files[0]) if pdb_files else BACKBONE_DIR
+                design_chain = "B"
+            else:
+                backbone_dir = BACKBONE_DIR
+                design_chain = "A"
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/step06_thread_and_repack.py "
+                f"--backbone_dir {backbone_dir} "
+                f"--fasta_dir {ABMPNN_DIR}/seqs "
+                f"--output_dir {PACKED_DIR} "
+                f"--design_chain {design_chain} --max_iter 200"
+            )
+
+    # ===================================================================
+    # Rosetta relax
+    # ===================================================================
+
+    rule rosetta_relax:
+        """Interface-focused Rosetta relax + interface scoring."""
+        input:
+            packed_done=(
+                os.path.join(AF3SCORE_OUTDIR, "filtered_links", ".done")
+                if MODE in ("full", "binder_affinity")
+                else os.path.join(PACKED_DIR, ".done")
+            )
+        output:
+            done=touch(os.path.join(RELAX_DIR, ".done"))
+        threads: 4
+        resources:
+            mem_mb=16000
+        run:
+            pdb_input_dir = (
+                os.path.join(AF3SCORE_OUTDIR, "filtered_links")
+                if MODE in ("full", "binder_affinity")
+                else PACKED_DIR
+            )
+            # Hardcode num_workers=4 because Snakemake's cluster wrapper
+            # scales {threads} down to 1 when running nested Snakemake
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/relax_interface.py "
+                f"--pdb_dir {pdb_input_dir} "
+                f"--output_dir {RELAX_DIR} "
+                f"--batch_idx 0 --dump_pdb True --num_workers 4"
+            )
+
+    # ===================================================================
+    # AF3 Refold (automated via checkpoint pattern)
+    # ===================================================================
+
+    checkpoint prepare_af3_jsons:
+        """Create one AF3 JSON per design from sidechain-packed PDBs."""
+        input:
+            packed_done=(
+                os.path.join(AF3SCORE_OUTDIR, "filtered_links", ".done")
+                if MODE in ("full", "binder_affinity")
+                else os.path.join(PACKED_DIR, ".done")
+            )
+        output:
+            done=touch(os.path.join(AF3_REFOLD_DIR, "json", ".done"))
+        run:
+            pdb_input_dir = (
+                os.path.join(AF3SCORE_OUTDIR, "filtered_links")
+                if MODE in ("full", "binder_affinity")
+                else PACKED_DIR
+            )
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/prepare_af3_refold_jsons.py "
+                f"--pdb_dir {pdb_input_dir} "
+                f"--output_dir {AF3_REFOLD_DIR}/json "
+                f"--num_seeds {AF3_REFOLD_SEEDS}"
+            )
+
+
+    rule af3_refold_single:
+        """Run AF3 on a single design JSON [GPU]."""
+        input:
+            json_file=os.path.join(AF3_REFOLD_DIR, "json", "{design}.json")
+        output:
+            done=touch(os.path.join(AF3_REFOLD_DIR, "af3_raw", "{design}.done"))
+        resources:
+            gpu=1,
+            mem_mb=20000
+        shell:
+            "bash {PPIFLOW_ROOT}/workflow/run_af3_single.sh "
+            "{input.json_file} {AF3_REFOLD_DIR}/af3_raw "
+            "{AF3_HOME} {AF3_MODEL_DIR}"
+
+
+    rule convert_af3_output:
+        """Convert AF3 CIF output to PDB for DockQ scoring."""
+        input:
+            af3_done=os.path.join(AF3_REFOLD_DIR, "af3_raw", "{design}.done")
+        output:
+            done=touch(os.path.join(AF3_REFOLD_DIR, "pdb", "{design}", ".done"))
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/convert_af3_output.py "
+            "--af3_output_dir {AF3_REFOLD_DIR}/af3_raw "
+            "--design {wildcards.design} "
+            "--output_dir {AF3_REFOLD_DIR}/pdb/{wildcards.design}"
+
+
+    def aggregate_af3_refold(wildcards):
+        """Discover designs from checkpoint output and request all conversions."""
+        checkpoint_output = checkpoints.prepare_af3_jsons.get(**wildcards).output.done
+        json_dir = os.path.join(AF3_REFOLD_DIR, "json")
+        designs, = glob_wildcards(os.path.join(json_dir, "{d}.json"))
+        # Exclude the .done sentinel file stem
+        designs = [d for d in designs if d != ".done" and not d.startswith(".")]
+        return expand(os.path.join(AF3_REFOLD_DIR, "pdb", "{design}", ".done"),
+                      design=designs)
+
+
+    rule af3_refold_done:
+        """Aggregation: all AF3 refolds complete and converted to PDB."""
+        input:
+            aggregate_af3_refold
+        output:
+            done=touch(os.path.join(AF3_REFOLD_DIR, ".done"))
+
+    # ===================================================================
+    # DockQ scoring
+    # ===================================================================
+
+    _DOCKQ_REFERENCE_DIR = (
+        os.path.join(AF3SCORE_OUTDIR, "filtered_links") if MODE in ("full", "binder_affinity")
+        else PACKED_DIR
+    )
+
+    rule dockq:
+        """DockQ scoring of AF3-refolded structures against designed references."""
+        input:
+            af3_done=os.path.join(AF3_REFOLD_DIR, ".done"),
+            relax_done=os.path.join(RELAX_DIR, ".done")
+        output:
+            csv=os.path.join(DOCKQ_DIR, "summary_dockq_scores.csv")
+        resources:
+            mem_mb=8000
+        params:
+            reference_dir=_DOCKQ_REFERENCE_DIR
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/run_DockQv2_eachfolder_v2.py "
+            "--input_dir {AF3_REFOLD_DIR}/pdb "
+            "--reference_dir {params.reference_dir} "
+            "--output_dir {DOCKQ_DIR} "
+            "--shell_dir {DOCKQ_DIR}/shell && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/parse_dockq_scores.py {DOCKQ_DIR}"
+
+    # ===================================================================
+    # Final ranking
+    # ===================================================================
+
+    if MODE in ("full", "binder_affinity"):
+        rule ranking:
+            """Final ranking: DockQ + interface score + AF3Score."""
+            input:
+                dockq_csv=os.path.join(DOCKQ_DIR, "summary_dockq_scores.csv"),
+                relax_done=os.path.join(RELAX_DIR, ".done"),
+                af3score_csv=os.path.join(AF3SCORE_OUTDIR, "af3score_results.csv")
+            output:
+                csv=os.path.join(OUTDIR, "final_ranking.csv")
+            run:
+                import pandas as pd
+                import glob as glob_mod
+
+                df_dockq = pd.read_csv(input.dockq_csv)
+
+                relax_csvs = glob_mod.glob(os.path.join(RELAX_DIR, "rosetta_complex_*.csv"))
+                df_relax = pd.concat([pd.read_csv(f) for f in relax_csvs])
+
+                df_af3 = pd.read_csv(input.af3score_csv)
+
+                df = df_dockq.merge(
+                    df_relax[["pdb_name", "interface_score"]],
+                    left_on="FolderName", right_on="pdb_name", how="left"
+                )
+                df = df.merge(
+                    df_af3[["description", "iptm", "ptm_A"]],
+                    left_on="FolderName", right_on="description", how="left"
+                )
+
+                filtered = df[
+                    (df["Overall_Avg_DockQ"] > 0.49) &
+                    (df["ptm_A"] > 0.8) &
+                    (df["iptm"] > 0.7)
+                ].copy()
+                filtered["score"] = (
+                    filtered["iptm"] * 100
+                ) - filtered["interface_score"]
+                filtered = filtered.sort_values("score", ascending=False)
+
+                filtered.to_csv(output.csv, index=False)
+                print(f"{len(filtered)} designs passed all filters")
+                if not filtered.empty:
+                    print("\nTop designs:")
+                    print(filtered[["FolderName", "Overall_Avg_DockQ", "iptm",
+                                    "ptm_A", "interface_score", "score"]].head(
+                                        10).to_string(index=False))
+
+    else:
+        rule ranking:
+            """Final ranking: DockQ + interface score."""
+            input:
+                dockq_csv=os.path.join(DOCKQ_DIR, "summary_dockq_scores.csv"),
+                relax_done=os.path.join(RELAX_DIR, ".done")
+            output:
+                csv=os.path.join(OUTDIR, "final_ranking.csv")
+            run:
+                import pandas as pd
+                import glob as glob_mod
+
+                df_dockq = pd.read_csv(input.dockq_csv)
+
+                relax_csvs = glob_mod.glob(os.path.join(RELAX_DIR, "rosetta_complex_*.csv"))
+                df_relax = pd.concat([pd.read_csv(f) for f in relax_csvs])
+
+                df = df_dockq.merge(
+                    df_relax[["pdb_name", "interface_score"]],
+                    left_on="FolderName", right_on="pdb_name", how="left"
+                )
+                filtered = df[df["Overall_Avg_DockQ"] > 0.49].copy()
+                filtered["score"] = (
+                    filtered["Overall_Avg_DockQ"] * 100
+                ) - filtered["interface_score"]
+                filtered = filtered.sort_values("score", ascending=False)
+
+                filtered.to_csv(output.csv, index=False)
+                print(f"{len(filtered)} designs passed DockQ > 0.49 filter")
+                if not filtered.empty:
+                    print("\nTop designs:")
+                    print(filtered[["FolderName", "Overall_Avg_DockQ",
+                                    "interface_score", "score"]].head(10).to_string(
+                                        index=False))
+
+# ===================================================================
+# Binder affinity maturation rules
+# ===================================================================
+
+if MODE == "binder_affinity":
+    rule binder_contact_analysis:
+        """Step 1b: Extract binder interface contacts for seqdesign fixed positions."""
+        input:
+            energy_csv=os.path.join(ENERGY_DIR, "residue_energy.csv"),
+            hotspots=os.path.join(ENERGY_DIR, "hotspots.txt")
+        output:
+            fixpos_info=os.path.join(ENERGY_DIR, "binder_fixed_positions.json")
+        resources:
+            mem_mb=4000
+        run:
+            import csv as csv_mod
+            key_residues = []
+            with open(input.energy_csv) as f:
+                reader = csv_mod.DictReader(f)
+                for row in reader:
+                    if float(row["binder_energy"]) < ENERGY_THRESHOLD:
+                        key_residues.append(row["residue"])
+            with open(input.hotspots) as f:
+                hotspots_str = f.read().strip()
+            key_nums = sorted({int("".join(c for c in r if c.isdigit()))
+                               for r in key_residues if any(c.isdigit() for c in r)})
+            fixed_data = {
+                "key_contact_residues": key_residues,
+                "key_res_nums": key_nums,
+                "hotspots": hotspots_str,
+            }
+            with open(output.fixpos_info, "w") as f:
+                json.dump(fixed_data, f, indent=2)
+
+    rule partial_flow_binder:
+        """Step 2: Partial flow backbone refinement for binder (GPU)."""
+        input:
+            pdb=INPUT_PDB,
+            fixpos_info=os.path.join(ENERGY_DIR, "binder_fixed_positions.json")
+        output:
+            done=touch(os.path.join(BACKBONE_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            with open(input.fixpos_info) as f:
+                d = json.load(f)
+            hotspots = d.get("hotspots", "")
+            hotspot_arg = (
+                f'--specified_hotspots "{hotspots}"' if hotspots else ""
+            )
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/sample_binder_partial.py "
+                f"--input_pdb {input.pdb} "
+                f"--target_chain C --binder_chain A "
+                f"--start_t {START_T} "
+                f"--samples_per_target {SAMPLES_PER_TARGET} "
+                f"--config {PPIFLOW_ROOT}/configs/inference_binder_partial.yaml "
+                f"--model_weights {PPIFLOW_ROOT}/checkpoints/binder.ckpt "
+                f"{hotspot_arg} "
+                f"--output_dir {BACKBONE_DIR} "
+                f"--name {NAME}"
+            )
+
+    rule seqdesign_binder:
+        """Step 3: ProteinMPNN (soluble) sequence design for binder (GPU)."""
+        input:
+            backbone_done=os.path.join(BACKBONE_DIR, ".done"),
+            fixpos_info=os.path.join(ENERGY_DIR, "binder_fixed_positions.json")
+        output:
+            done=touch(os.path.join(ABMPNN_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            import glob as glob_mod
+            os.makedirs(ABMPNN_DIR, exist_ok=True)
+
+            with open(input.fixpos_info) as f:
+                d = json.load(f)
+            key_nums = d.get("key_res_nums", [])
+            fixed_str = " ".join(str(n) for n in key_nums)
+
+            # PDBs may be written to a subdirectory by sample_binder_partial.py
+            pdb_files = sorted(glob_mod.glob(os.path.join(BACKBONE_DIR, "**", "*.pdb"), recursive=True))
+            pdb_dir = os.path.dirname(pdb_files[0]) if pdb_files else BACKBONE_DIR
+
+            # Write per-backbone fixed_positions.csv
+            fixpos_csv = os.path.join(ABMPNN_DIR, "fixed_positions.csv")
+            with open(fixpos_csv, "w") as fh:
+                fh.write("pdb_name,motif_index\n")
+                for pdb in pdb_files:
+                    stem = os.path.splitext(os.path.basename(pdb))[0]
+                    fh.write(f"{stem},{fixed_str}-\n")
+
+            position_list_arg = (
+                f'--position_list "{fixpos_csv}"' if key_nums else ""
+            )
+
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/ProteinMPNN/protein_mpnn_run.py "
+                f'--path_to_model_weights '
+                f'"{PPIFLOW_ROOT}/ProteinMPNN/soluble_model_weights/" '
+                f'--model_name "v_48_020" '
+                f'--folder_with_pdbs_path "{pdb_dir}" '
+                f'--out_folder "{ABMPNN_DIR}" '
+                f'--chain_list "B" '
+                f'{position_list_arg} '
+                f"--num_seq_per_target {NUM_SEQ_PER_TARGET} "
+                f"--sampling_temp {SAMPLING_TEMP} "
+                f"--seed 37 "
+                f"--batch_size {NUM_SEQ_PER_TARGET} "
+                f"--omit_AAs C"
+            )
+
+
+# ===================================================================
+# Two-round de novo pipeline (nanobody_full + binder_full)
+# ===================================================================
+
+if MODE in ("nanobody_full", "binder_full", "nanobody_metal_full", "binder_metal_full"):
+
+    # ---------------------------------------------------------------
+    # Step 0: Prepare receptor (rename target chain → C)
+    # ---------------------------------------------------------------
+
+    rule dn2_prepare_receptor:
+        """Step 0: Copy or rename receptor PDB (ensure antigen is chain C)."""
+        input:
+            raw=INPUT_FILE
+        output:
+            pdb=INPUT_PDB
+        run:
+            os.makedirs(os.path.dirname(output.pdb), exist_ok=True)
+            if INPUT_TYPE == "cif":
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/step01_cif_to_pdb.py "
+                    f"--input_cif {input.raw} --output_pdb {output.pdb} "
+                    f"--nanobody_chain _ --receptor_chain {ANTIGEN_CHAIN}"
+                )
+            else:
+                with open(input.raw) as fin, open(output.pdb, "w") as fout:
+                    if "," in ANTIGEN_CHAIN:
+                        # Multi-chain target: chains already correctly named,
+                        # just copy as-is.
+                        fout.write(fin.read())
+                    else:
+                        for line in fin:
+                            if line.startswith("ATOM"):
+                                # Only rename protein ATOM records; HETATM (ions,
+                                # ligands) keep their original chain IDs so that
+                                # copy_ions.py can distinguish multiple instances.
+                                line = line[:21] + ANTIGEN_CHAIN + line[22:]
+                            fout.write(line)
+
+    # ---------------------------------------------------------------
+    # Step 1: De novo backbone generation [GPU]
+    # ---------------------------------------------------------------
+
+    rule dn2_generation_chunk:
+        """Step 1 (parallel): Generate one chunk of de novo backbones [GPU]."""
+        input:
+            antigen=INPUT_PDB
+        output:
+            done=touch(os.path.join(DN2_GEN_DIR, "chunks", "{chunk}", ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            import math
+            chunk_size = math.ceil(R1_SAMPLES / N_GEN_CHUNKS)
+            chunk_dir = os.path.join(DN2_GEN_DIR, "chunks", wildcards.chunk)
+            os.makedirs(chunk_dir, exist_ok=True)
+            chunk_name = f"{NAME}_c{wildcards.chunk}"
+            if DESIGN_TYPE == "nanobody":
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/sample_antibody_nanobody.py "
+                    f"--antigen_pdb {input.antigen} "
+                    f"--antigen_chain {ANTIGEN_CHAIN} "
+                    f"--framework_pdb {FRAMEWORK_PDB} "
+                    f"--heavy_chain {HEAVY_CHAIN} "
+                    f"--cdr_length '{CDR_LENGTH}' "
+                    f"--specified_hotspots '{HOTSPOTS}' "
+                    f"--config {PPIFLOW_ROOT}/configs/inference_nanobody.yaml "
+                    f"--samples_per_target {chunk_size} "
+                    f"--model_weights {PPIFLOW_ROOT}/checkpoints/nanobody.ckpt "
+                    f"--flexible_target_residues '{FLEX_TARGET_RESIDUES}' "
+                    f"--flexibility_sigma {FLEXIBILITY_SIGMA} "
+                    f"--flex_sigma {FLEX_SIGMA} --flex_start_t {FLEX_START_T} "
+                    f"--output_dir {chunk_dir} --name {chunk_name}"
+                )
+            else:
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/sample_binder.py "
+                    f"--input_pdb {input.antigen} "
+                    f"--target_chain {ANTIGEN_CHAIN} "
+                    f"--specified_hotspots '{HOTSPOTS}' "
+                    f"--samples_min_length {BINDER_MIN_LEN} "
+                    f"--samples_max_length {BINDER_MAX_LEN} "
+                    f"--samples_per_target {chunk_size} "
+                    f"--config {PPIFLOW_ROOT}/configs/inference_binder.yaml "
+                    f"--model_weights {PPIFLOW_ROOT}/checkpoints/binder.ckpt "
+                    f"--flexible_target_residues '{FLEX_TARGET_RESIDUES}' "
+                    f"--flexibility_sigma {FLEXIBILITY_SIGMA} "
+                    f"--output_dir {chunk_dir} --name {chunk_name}"
+                )
+
+    rule dn2_generation:
+        """Step 1 (gather): Collect all generation chunks into 01_denovo/."""
+        input:
+            expand(os.path.join(DN2_GEN_DIR, "chunks", "{chunk}", ".done"),
+                   chunk=[f"{i:03d}" for i in range(N_GEN_CHUNKS)])
+        output:
+            done=touch(os.path.join(DN2_GEN_DIR, ".done"))
+        run:
+            import shutil, glob as glob_mod
+            import pandas as pd
+            # Copy PDBs
+            count = 0
+            for pdb in sorted(glob_mod.glob(
+                    os.path.join(DN2_GEN_DIR, "chunks", "*", "*.pdb"))):
+                dst = os.path.join(DN2_GEN_DIR, os.path.basename(pdb))
+                shutil.copy2(pdb, dst)
+                count += 1
+            # Merge sample_metrics.csv files
+            csv_files = sorted(glob_mod.glob(
+                os.path.join(DN2_GEN_DIR, "chunks", "*", "sample_metrics.csv")))
+            if csv_files:
+                merged = pd.concat(
+                    [pd.read_csv(f) for f in csv_files], ignore_index=True)
+                merged.to_csv(
+                    os.path.join(DN2_GEN_DIR, "sample_metrics.csv"), index=False)
+            print(f"Gathered {count} backbones into {DN2_GEN_DIR}")
+
+    # ---------------------------------------------------------------
+    # Step 1b: Filter backbones by CDR interface ratio
+    # ---------------------------------------------------------------
+
+    rule dn2_filter_backbones:
+        """Step 1b: Filter backbones by CDR interface ratio."""
+        input:
+            backbone_done=os.path.join(DN2_GEN_DIR, ".done")
+        output:
+            done=touch(os.path.join(DN2_FILTER_DIR, ".done"))
+        resources:
+            mem_mb=4000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+            "filter_backbones.py "
+            "--backbone_dir {DN2_GEN_DIR} "
+            "--output_dir {DN2_FILTER_DIR} "
+            "--threshold {CDR_RATIO_THRESH}"
+
+    # ---------------------------------------------------------------
+    # Step 2: R1 Position analysis
+    # ---------------------------------------------------------------
+
+    rule dn2_position_analysis_r1:
+        """Step 2: CDR/framework analysis for R1 designs."""
+        input:
+            backbone_done=os.path.join(DN2_FILTER_DIR, ".done")
+        output:
+            fixed_json=os.path.join(DN2_POS_R1_DIR, "fixed_positions.json"),
+            cdr_csv=os.path.join(DN2_POS_R1_DIR, "cdr_idx.csv")
+        resources:
+            mem_mb=4000
+        run:
+            os.makedirs(DN2_POS_R1_DIR, exist_ok=True)
+
+            if DESIGN_TYPE == "nanobody":
+                import pandas as pd
+                # Extract CDR/framework positions from the framework PDB
+                # (de novo backbones are poly-ala, so use the framework which
+                # has real VH sequence for abnumber CDR annotation)
+                fw_dir = os.path.dirname(FRAMEWORK_PDB)
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/get_cdr.py "
+                    f"{fw_dir} {output.cdr_csv}"
+                )
+                fw_indices, cdr_positions = [], ""
+                if os.path.exists(str(output.cdr_csv)):
+                    df = pd.read_csv(str(output.cdr_csv))
+                    if not df.empty:
+                        r = df.iloc[0]
+                        fw_str = str(r.get("fw_index", ""))
+                        fw_indices = fw_str.split() if fw_str else []
+                        cdr_positions = str(r.get("r2_cdr_pos", ""))
+
+                fw_nums = sorted({int("".join(c for c in i if c.isdigit()))
+                                 for i in fw_indices
+                                 if any(c.isdigit() for c in i)})
+                fixed_data = {
+                    "cdr_positions": cdr_positions,
+                    "abmpnn_fw_and_key_fixed": " ".join(
+                        str(x) for x in fw_nums),
+                    "fw_indices": fw_indices,
+                }
+            else:
+                # Binder mode: no CDRs, no framework
+                with open(output.cdr_csv, "w") as f:
+                    f.write("placeholder\n")
+                fixed_data = {
+                    "cdr_positions": "",
+                    "abmpnn_fw_and_key_fixed": "",
+                    "fw_indices": [],
+                }
+
+            with open(output.fixed_json, "w") as f:
+                json.dump(fixed_data, f, indent=2)
+
+    # ---------------------------------------------------------------
+    # Step 3: R1 Sequence design [GPU]
+    # ---------------------------------------------------------------
+
+    rule dn2_seqdesign_r1:
+        """Step 3: R1 sequence design [GPU].
+        Metal mode: LigandMPNN on backbone+ion PDBs.
+        Non-metal mode: AbMPNN (nanobody) or dual ProteinMPNN (binder).
+        """
+        input:
+            filter_done=(
+                os.path.join(DN2_FILTER_IONS_DIR, ".done")
+                if IS_METAL else
+                os.path.join(DN2_FILTER_DIR, ".done")
+            )
+        output:
+            done=touch(os.path.join(DN2_SEQ_R1_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            import glob as glob_mod
+            import shutil
+            os.makedirs(DN2_SEQ_R1_DIR, exist_ok=True)
+
+            if IS_METAL:
+                # Metal mode: LigandMPNN on backbone+ion PDBs
+                pdb_dir = DN2_FILTER_IONS_DIR
+                fixpos_arg = ""
+                if DESIGN_TYPE == "nanobody":
+                    # b-factors encoding framework are in ATOM records (unchanged
+                    # by copy_ions), so read from backbone-only dir
+                    shell(
+                        f"cd {PPIFLOW_ROOT} && "
+                        f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/make_fix_csv.py "
+                        f"{DN2_FILTER_DIR}"
+                    )
+                    fixpos_csv = os.path.join(
+                        DN2_FILTER_DIR, "fixed_positions.csv")
+                    shutil.copy(fixpos_csv, os.path.join(
+                        DN2_SEQ_R1_DIR, "fixed_positions.csv"))
+                    fixpos_arg = f"--fixed_residues_csv {fixpos_csv}"
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+                    f"run_ligandmpnn.py "
+                    f"--input_dir {pdb_dir} "
+                    f"--output_dir {DN2_SEQ_R1_DIR} "
+                    f"--ligandmpnn_dir {LIGANDMPNN_DIR} "
+                    f"--chains_to_design A "
+                    f"{fixpos_arg} "
+                    f"--num_seq_per_target {R1_NUM_SEQ} "
+                    f"--sampling_temp {R1_SAMPLING_TEMP} "
+                    f"--seed 37"
+                )
+
+            elif DESIGN_TYPE == "nanobody":
+                # Non-metal nanobody: AbMPNN with b-factor fixed positions
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/make_fix_csv.py "
+                    f"{DN2_FILTER_DIR}"
+                )
+                fixpos_csv = os.path.join(
+                    DN2_FILTER_DIR, "fixed_positions.csv")
+                shutil.copy(fixpos_csv, os.path.join(
+                    DN2_SEQ_R1_DIR, "fixed_positions.csv"))
+
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/ProteinMPNN/"
+                    f"protein_mpnn_run.py "
+                    f'--path_to_model_weights '
+                    f'"{PPIFLOW_ROOT}/ProteinMPNN/model_weights/" '
+                    f'--model_name "abmpnn" '
+                    f'--folder_with_pdbs_path "{DN2_FILTER_DIR}" '
+                    f'--out_folder "{DN2_SEQ_R1_DIR}" '
+                    f'--chain_list "A" '
+                    f'--position_list "{fixpos_csv}" '
+                    f"--num_seq_per_target {R1_NUM_SEQ} "
+                    f"--sampling_temp {R1_SAMPLING_TEMP} "
+                    f"--seed 37 "
+                    f"--batch_size {R1_NUM_SEQ} "
+                    f"--omit_AAs C"
+                )
+
+            else:
+                # Non-metal binder: dual-strategy vanilla + hydrophobic-biased
+                # Run 1: Vanilla ProteinMPNN
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/ProteinMPNN/"
+                    f"protein_mpnn_run.py "
+                    f'--path_to_model_weights '
+                    f'"{PPIFLOW_ROOT}/ProteinMPNN/'
+                    f'vanilla_model_weights/" '
+                    f'--model_name "v_48_020" '
+                    f'--folder_with_pdbs_path "{DN2_FILTER_DIR}" '
+                    f'--out_folder "{DN2_SEQ_R1_DIR}/vanilla" '
+                    f'--chain_list "A" '
+                    f"--num_seq_per_target {R1_NUM_SEQ} "
+                    f"--sampling_temp {R1_SAMPLING_TEMP} "
+                    f"--seed 37 "
+                    f"--batch_size {R1_NUM_SEQ} "
+                    f"--omit_AAs C"
+                )
+
+                # Run 2: Hydrophobic-biased ProteinMPNN
+                bias_file = os.path.join(
+                    DN2_SEQ_R1_DIR, "hydrophobic_bias.jsonl")
+                with open(bias_file, "w") as f:
+                    f.write(HYDRO_BIAS + "\n")
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/ProteinMPNN/"
+                    f"protein_mpnn_run.py "
+                    f'--path_to_model_weights '
+                    f'"{PPIFLOW_ROOT}/ProteinMPNN/'
+                    f'vanilla_model_weights/" '
+                    f'--model_name "v_48_020" '
+                    f'--folder_with_pdbs_path "{DN2_FILTER_DIR}" '
+                    f'--out_folder "{DN2_SEQ_R1_DIR}/biased" '
+                    f'--chain_list "A" '
+                    f"--num_seq_per_target {R1_NUM_SEQ} "
+                    f"--sampling_temp {R1_SAMPLING_TEMP} "
+                    f'--bias_AA_jsonl "{bias_file}" '
+                    f"--seed 42 "
+                    f"--batch_size {R1_NUM_SEQ} "
+                    f"--omit_AAs C"
+                )
+
+                # Merge FASTAs from vanilla + biased into seqs/
+                vanilla_dir = os.path.join(
+                    DN2_SEQ_R1_DIR, "vanilla", "seqs")
+                biased_dir = os.path.join(
+                    DN2_SEQ_R1_DIR, "biased", "seqs")
+                merged_dir = os.path.join(DN2_SEQ_R1_DIR, "seqs")
+                os.makedirs(merged_dir, exist_ok=True)
+
+                fa_names = set()
+                for d in [vanilla_dir, biased_dir]:
+                    if os.path.isdir(d):
+                        for f in os.listdir(d):
+                            if f.endswith(".fa"):
+                                fa_names.add(f)
+
+                for fa_name in sorted(fa_names):
+                    entries = []
+                    native = None
+                    for d in [vanilla_dir, biased_dir]:
+                        fa_path = os.path.join(d, fa_name)
+                        if not os.path.exists(fa_path):
+                            continue
+                        seqs = []
+                        header = None
+                        seq_lines = []
+                        with open(fa_path) as fh:
+                            for line in fh:
+                                line = line.strip()
+                                if line.startswith(">"):
+                                    if header is not None:
+                                        seqs.append((header,
+                                                     "".join(seq_lines)))
+                                    header = line[1:]
+                                    seq_lines = []
+                                else:
+                                    seq_lines.append(line)
+                        if header is not None:
+                            seqs.append((header, "".join(seq_lines)))
+                        if seqs and native is None:
+                            native = seqs[0]
+                        entries.extend(seqs[1:])
+
+                    out_path = os.path.join(merged_dir, fa_name)
+                    with open(out_path, "w") as fh:
+                        if native:
+                            fh.write(f">{native[0]}\n"
+                                     f"{native[1]}\n")
+                        for hdr, seq in entries:
+                            fh.write(f">{hdr}\n{seq}\n")
+
+                print(f"Merged {len(fa_names)} FASTAs "
+                      f"({R1_NUM_SEQ} vanilla + {R1_NUM_SEQ} biased "
+                      f"= {2*R1_NUM_SEQ} seq/backbone)")
+
+    # ---------------------------------------------------------------
+    # Step 4: R1 FlowPacker sidechain packing [GPU]
+    # ---------------------------------------------------------------
+
+    rule dn2_flowpacker_r1:
+        """Step 4: FlowPacker sidechain packing for R1 designs [GPU]."""
+        input:
+            filter_done=os.path.join(DN2_FILTER_DIR, ".done"),
+            seqdesign_done=os.path.join(DN2_SEQ_R1_DIR, ".done")
+        output:
+            done=touch(os.path.join(DN2_PACK_R1_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            if FLOWPACKER_DIR:
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+                    f"run_flowpacker.py "
+                    f"--backbone_dir {DN2_FILTER_DIR} "
+                    f"--fasta_dir {DN2_SEQ_R1_DIR}/seqs "
+                    f"--output_dir {DN2_PACK_R1_DIR} "
+                    f"--flowpacker_dir {FLOWPACKER_DIR} "
+                    f"--flowpacker_ckpt {FLOWPACKER_CKPT} "
+                    f"--design_chain A"
+                )
+            else:
+                # Fallback to PyRosetta if no FlowPacker configured
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+                    f"step06_thread_and_repack.py "
+                    f"--backbone_dir {DN2_FILTER_DIR} "
+                    f"--fasta_dir {DN2_SEQ_R1_DIR}/seqs "
+                    f"--output_dir {DN2_PACK_R1_DIR} "
+                    f"--design_chain A --max_iter 200"
+                )
+
+    # ---------------------------------------------------------------
+    # Step 4b (metal only): copy ions into seqdesign and packed dirs
+    # ---------------------------------------------------------------
+
+    if IS_METAL:
+        rule dn2_copy_ions_for_seqdesign_r1:
+            """Step 4b (metal): Copy ion HETATMs into backbone PDBs for LigandMPNN."""
+            input:
+                filter_done=os.path.join(DN2_FILTER_DIR, ".done"),
+                source_pdb=INPUT_PDB
+            output:
+                done=touch(os.path.join(DN2_FILTER_IONS_DIR, ".done"))
+            resources:
+                mem_mb=4000
+            shell:
+                "cd {PPIFLOW_ROOT} && "
+                "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/copy_ions.py "
+                "--source_pdb {input.source_pdb} "
+                "--input_dir {DN2_FILTER_DIR} "
+                "--output_dir {DN2_FILTER_IONS_DIR} "
+                f"--ion_names '{ION_NAMES}'"
+
+        rule dn2_copy_ions_r1:
+            """Step 4b (metal): Copy ion HETATMs into packed R1 PDBs for AF3Score."""
+            input:
+                packed_done=os.path.join(DN2_PACK_R1_DIR, ".done"),
+                source_pdb=INPUT_PDB
+            output:
+                done=touch(os.path.join(DN2_PACK_R1_IONS_DIR, ".done"))
+            resources:
+                mem_mb=4000
+            shell:
+                "cd {PPIFLOW_ROOT} && "
+                "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/copy_ions.py "
+                "--source_pdb {input.source_pdb} "
+                "--input_dir {DN2_PACK_R1_DIR} "
+                "--output_dir {DN2_PACK_R1_IONS_DIR} "
+                f"--ion_names '{ION_NAMES}'"
+
+    # ---------------------------------------------------------------
+    # Step 5: R1 AF3Score [GPU, batched via checkpoint]
+    # ---------------------------------------------------------------
+
+    checkpoint dn2_af3score_r1_prepare:
+        """Prepare AF3Score JSON inputs and batches for R1."""
+        input:
+            packed_done=(
+                os.path.join(DN2_PACK_R1_IONS_DIR, ".done")
+                if IS_METAL else
+                os.path.join(DN2_PACK_R1_DIR, ".done")
+            )
+        output:
+            done=touch(os.path.join(
+                DN2_AF3S_R1_DIR, "batch", ".prepared"))
+        resources:
+            mem_mb=8000
+        run:
+            input_dir = DN2_PACK_R1_IONS_DIR if IS_METAL else DN2_PACK_R1_DIR
+            ion_arg = (
+                f"--ion_source_pdb {INPUT_PDB}"
+                if IS_METAL else ""
+            )
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"mkdir -p {DN2_AF3S_R1_DIR}/json "
+                f"{DN2_AF3S_R1_DIR}/batch && "
+                f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/"
+                f"flowpacker_af3score/4.1-prepare_get_json.py "
+                f"--input_dir {input_dir} "
+                f"--output_dir_cif {DN2_AF3S_R1_DIR}/single_chain_cif "
+                f"--save_csv {DN2_AF3S_R1_DIR}/seq.csv "
+                f"--output_dir_json {DN2_AF3S_R1_DIR}/json "
+                f"--batch_dir {DN2_AF3S_R1_DIR}/batch "
+                f"--num_jobs {AF3SCORE_NUM_JOBS} "
+                f"{ion_arg}"
+            )
+
+    rule dn2_af3score_r1_jax_batch:
+        """Convert PDBs to JAX h5 for one R1 AF3Score batch."""
+        input:
+            prepared=os.path.join(
+                DN2_AF3S_R1_DIR, "batch", ".prepared"),
+            batch_json=os.path.join(
+                DN2_AF3S_R1_DIR, "batch", "json", "{batch_name}")
+        output:
+            done=touch(os.path.join(
+                DN2_AF3S_R1_DIR, "batch", "h5",
+                "{batch_name}", ".done"))
+        resources:
+            mem_mb=16000
+        shell:
+            """
+            eval "$('/apps/easybd/programs/miniconda/24.11_environmentally/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+            conda activate {AF3SCORE_DIR}/env
+            export JAX_PLATFORM_NAME=cpu
+            cd {PPIFLOW_ROOT}
+            mkdir -p "{DN2_AF3S_R1_DIR}/batch/h5/{wildcards.batch_name}"
+            {AF3SCORE_PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/4.2_prepare_pdb2jax.py \
+                --pdb_folder "{DN2_AF3S_R1_DIR}/batch/pdb/{wildcards.batch_name}" \
+                --output_folder "{DN2_AF3S_R1_DIR}/batch/h5/{wildcards.batch_name}"
+            """
+
+    rule dn2_af3score_r1_inference:
+        """Run AF3Score inference on one R1 batch [GPU]."""
+        input:
+            jax_done=os.path.join(
+                DN2_AF3S_R1_DIR, "batch", "h5",
+                "{batch_name}", ".done")
+        output:
+            done=touch(os.path.join(
+                DN2_AF3S_R1_DIR, "af3score_output",
+                "{batch_name}", ".done"))
+        resources:
+            mem_mb=32000,
+            gpu=1
+        shell:
+            """
+            eval "$('/apps/easybd/programs/miniconda/24.11_environmentally/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+            conda activate {AF3SCORE_DIR}/env
+            export CUDA_HOME=/apps/easybd/easybuild/amd/software/CUDA/12.4.0
+            export PATH=$CUDA_HOME/bin:$PATH
+            cd {PPIFLOW_ROOT}
+            export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false --xla_gpu_graph_level=0"
+            export XLA_PYTHON_CLIENT_PREALLOCATE=true
+            export XLA_CLIENT_MEM_FRACTION=0.90
+
+            mkdir -p "{DN2_AF3S_R1_DIR}/af3score_output/{wildcards.batch_name}"
+            {AF3SCORE_PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/run_af3score.py \
+                --db_dir={AF3SCORE_DB_DIR} \
+                --model_dir={AF3SCORE_MODEL_DIR} \
+                --batch_json_dir="{DN2_AF3S_R1_DIR}/batch/json/{wildcards.batch_name}" \
+                --batch_h5_dir="{DN2_AF3S_R1_DIR}/batch/h5/{wildcards.batch_name}" \
+                --output_dir="{DN2_AF3S_R1_DIR}/af3score_output/{wildcards.batch_name}" \
+                --run_data_pipeline=False \
+                --run_inference=true \
+                --init_guess=true \
+                --num_samples=1 \
+                --write_summary_confidences=true \
+                --write_full_confidences=true
+            """
+
+    def get_dn2_af3score_r1_batches(wildcards):
+        checkpoints.dn2_af3score_r1_prepare.get(**wildcards)
+        batch_json = os.path.join(DN2_AF3S_R1_DIR, "batch", "json")
+        batches = sorted([d for d in os.listdir(batch_json)
+                          if d.startswith("batch_")])
+        return expand(os.path.join(
+            DN2_AF3S_R1_DIR, "af3score_output", "{b}", ".done"),
+            b=batches)
+
+    rule dn2_af3score_r1_metrics:
+        """Extract metrics from R1 AF3Score output."""
+        input:
+            get_dn2_af3score_r1_batches
+        output:
+            csv=os.path.join(DN2_AF3S_R1_DIR, "af3score_results.csv")
+        resources:
+            mem_mb=4000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/"
+            "flowpacker_af3score/easy_get_metrics.py "
+            "{DN2_AF3S_R1_DIR}/af3score_output "
+            "{output.csv}"
+
+    rule dn2_af3score_r1_filter:
+        """Filter R1 designs by ipTM threshold."""
+        input:
+            csv=os.path.join(
+                DN2_AF3S_R1_DIR, "af3score_results.csv"),
+            packed_done=(
+                os.path.join(DN2_PACK_R1_IONS_DIR, ".done")
+                if IS_METAL else
+                os.path.join(DN2_PACK_R1_DIR, ".done")
+            )
+        output:
+            done=touch(os.path.join(
+                DN2_AF3S_R1_DIR, "filtered_links", ".done"))
+        run:
+            import pandas as pd
+            import shutil
+
+            # Metal mode: use ion PDBs for Rosetta interface energy (enrichment needs Zn).
+            # Partial flow strips HETATM itself before calling the model.
+            pack_dir = DN2_PACK_R1_IONS_DIR if IS_METAL else DN2_PACK_R1_DIR
+
+            df = pd.read_csv(input.csv)
+            passed = df[df["iptm"] > R1_IPTM_THRESH]
+
+            out_dir = os.path.join(
+                DN2_AF3S_R1_DIR, "filtered_links")
+            os.makedirs(out_dir, exist_ok=True)
+            # Build case-insensitive name→file map: AF3Score lowercases job
+            # names, but packed PDBs may have mixed-case prefixes (e.g. "K48").
+            pdb_map = {f.lower(): f for f in os.listdir(pack_dir)
+                       if f.endswith(".pdb")}
+            for _, row in passed.iterrows():
+                key = (row["description"] + ".pdb").lower()
+                fname = pdb_map.get(key)
+                if fname:
+                    shutil.copy(os.path.join(pack_dir, fname), out_dir)
+            passed.to_csv(os.path.join(
+                DN2_AF3S_R1_DIR, "filtered_results.csv"), index=False)
+            print(f"R1 AF3Score: {len(passed)}/{len(df)} passed "
+                  f"ipTM > {R1_IPTM_THRESH}")
+
+    # ---------------------------------------------------------------
+    # Step 6: Enrichment (interface energy + contact aggregation)
+    # ---------------------------------------------------------------
+
+    checkpoint dn2_enrichment:
+        """Compute enriched contacts from R1 filtered designs."""
+        input:
+            filtered_done=os.path.join(
+                DN2_AF3S_R1_DIR, "filtered_links", ".done"),
+            fixed_json=os.path.join(
+                DN2_POS_R1_DIR, "fixed_positions.json")
+        output:
+            manifest=os.path.join(
+                DN2_ENRICH_DIR, "enrichment_manifest.csv"),
+            done=touch(os.path.join(DN2_ENRICH_DIR, ".done"))
+        resources:
+            mem_mb=16000
+        run:
+            fw_arg = ""
+            if DESIGN_TYPE == "nanobody":
+                fw_arg = f'--fw_indices_json "{input.fixed_json}"'
+            # Nanobody backbones keep receptor as chain C (framework chain convention).
+            # Binder backbones output receptor as chain B (sample_binder.py convention).
+            target_chain = "C" if DESIGN_TYPE == "nanobody" else "B"
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+                f"step_enrichment.py "
+                f'--pdb_dir "{DN2_AF3S_R1_DIR}/filtered_links" '
+                f"--backbone_dir {DN2_GEN_DIR} "
+                f"--output_dir {DN2_ENRICH_DIR} "
+                f"--energy_threshold {ENERGY_THRESHOLD} "
+                f"--design_chain A --target_chain {target_chain} "
+                f"--design_type {DESIGN_TYPE} "
+                f"{fw_arg}"
+            )
+
+    # ---------------------------------------------------------------
+    # Step 7: Partial flow refinement [GPU, per backbone]
+    # ---------------------------------------------------------------
+
+    rule dn2_partial_flow_single:
+        """Run partial flow on one enriched backbone [GPU]."""
+        input:
+            enrichment_json=os.path.join(
+                DN2_ENRICH_DIR, "{backbone}.json"),
+            enrich_done=os.path.join(DN2_ENRICH_DIR, ".done"),
+            r1_fixed=os.path.join(
+                DN2_POS_R1_DIR, "fixed_positions.json")
+        output:
+            done=touch(os.path.join(
+                DN2_PFLOW_DIR, "per_backbone",
+                "{backbone}", ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            import tempfile as _tempfile
+            with open(input.enrichment_json) as f:
+                enrich = json.load(f)
+            representative_pdb = enrich["representative_pdb"]
+            out_dir = os.path.join(
+                DN2_PFLOW_DIR, "per_backbone", wildcards.backbone)
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Strip HETATM records (ions, water) — partial flow model is protein-only.
+            # Write a protein-only temp PDB so Zn in filtered_links doesn't break datasets.
+            if IS_METAL:
+                _tmp = _tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".pdb", delete=False,
+                    dir=out_dir, prefix="protein_only_")
+                with open(representative_pdb) as _src:
+                    for _line in _src:
+                        if _line.startswith(("ATOM", "TER", "END")):
+                            _tmp.write(_line)
+                _tmp.close()
+                representative_pdb = _tmp.name
+
+            if DESIGN_TYPE == "nanobody":
+                with open(input.r1_fixed) as f:
+                    r1_data = json.load(f)
+                cdr_pos = r1_data.get("cdr_positions", "")
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/"
+                    f"sample_antibody_nanobody_partial.py "
+                    f"--complex_pdb {representative_pdb} "
+                    f"--start_t {R2_START_T} "
+                    f'--fixed_positions '
+                    f'"{enrich["fixed_positions_str"]}" '
+                    f"--antigen_chain C --heavy_chain A "
+                    f"--config {PPIFLOW_ROOT}/configs/"
+                    f"inference_nanobody.yaml "
+                    f"--samples_per_target {R2_SAMPLES} "
+                    f'--cdr_position "{cdr_pos}" '
+                    f"--specified_hotspots '{HOTSPOTS}' "
+                    f"--retry_Limit 10 "
+                    f"--model_weights {PPIFLOW_ROOT}/"
+                    f"checkpoints/nanobody.ckpt "
+                    f"--flexible_target_residues "
+                    f"'{FLEX_TARGET_RESIDUES}' "
+                    f"--flexibility_sigma "
+                    f"{FLEXIBILITY_SIGMA} "
+                    f"--flex_sigma {FLEX_SIGMA} "
+                    f"--flex_start_t {FLEX_START_T} "
+                    f"--output_dir {out_dir} "
+                    f"--name {wildcards.backbone}"
+                )
+            else:
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/"
+                    f"sample_binder_partial.py "
+                    f"--input_pdb {representative_pdb} "
+                    f"--target_chain B --binder_chain A "
+                    f'--fixed_positions '
+                    f'"{enrich["motif_contig"]}" '
+                    f"--start_t {R2_START_T} "
+                    f"--samples_per_target {R2_SAMPLES} "
+                    f"--config {PPIFLOW_ROOT}/configs/"
+                    f"inference_binder_partial.yaml "
+                    f"--model_weights {PPIFLOW_ROOT}/"
+                    f"checkpoints/binder.ckpt "
+                    f"--flexible_target_residues "
+                    f"'{FLEX_TARGET_RESIDUES}' "
+                    f"--flexibility_sigma "
+                    f"{FLEXIBILITY_SIGMA} "
+                    f"--output_dir {out_dir} "
+                    f"--name {wildcards.backbone}"
+                )
+
+    def get_dn2_enriched_backbones(wildcards):
+        """Discover enriched backbones from checkpoint output."""
+        checkpoints.dn2_enrichment.get(**wildcards)
+        import csv as csv_mod
+        manifest = os.path.join(
+            DN2_ENRICH_DIR, "enrichment_manifest.csv")
+        backbones = []
+        with open(manifest) as f:
+            reader = csv_mod.DictReader(f)
+            for row in reader:
+                backbones.append(row["backbone_name"])
+        return expand(os.path.join(
+            DN2_PFLOW_DIR, "per_backbone", "{b}", ".done"),
+            b=backbones)
+
+    rule dn2_partial_flow_gather:
+        """Collect per-backbone partial flow outputs into flat dir."""
+        input:
+            get_dn2_enriched_backbones
+        output:
+            done=touch(os.path.join(DN2_PFLOW_DIR, ".done"))
+        run:
+            import shutil
+            import glob as glob_mod
+            gathered = os.path.join(DN2_PFLOW_DIR, "gathered")
+            os.makedirs(gathered, exist_ok=True)
+            per_bb = os.path.join(DN2_PFLOW_DIR, "per_backbone")
+            count = 0
+            for bb_dir in sorted(glob_mod.glob(
+                    os.path.join(per_bb, "*"))):
+                if not os.path.isdir(bb_dir):
+                    continue
+                bb_name = os.path.basename(bb_dir)
+                # Recurse to handle nested output dirs (e.g. binder
+                # puts PDBs in sample_{name}/ subdirectory).
+                # Name as {bb_name}_{i}.pdb so position_analysis_r2
+                # can recover the backbone name via re.sub(r'_\d+$','',stem).
+                pdbs = sorted(glob_mod.glob(
+                        os.path.join(bb_dir, "**", "*.pdb"),
+                        recursive=True))
+                for i, pdb in enumerate(pdbs):
+                    dst = os.path.join(gathered, f"{bb_name}_{i}.pdb")
+                    shutil.copy2(pdb, dst)
+                    count += 1
+            print(f"Gathered {count} R2 backbones into {gathered}")
+
+    # ---------------------------------------------------------------
+    # Step 8: R2 Position analysis
+    # ---------------------------------------------------------------
+
+    rule dn2_position_analysis_r2:
+        """Step 8: Build R2 fixed positions from enrichment."""
+        input:
+            pflow_done=os.path.join(DN2_PFLOW_DIR, ".done"),
+            enrich_done=os.path.join(DN2_ENRICH_DIR, ".done")
+        output:
+            fixpos_csv=os.path.join(
+                DN2_POS_R2_DIR, "fixed_positions.csv")
+        resources:
+            mem_mb=4000
+        run:
+            import glob as glob_mod
+            import re
+            from Bio import PDB as Bio_PDB
+
+            os.makedirs(DN2_POS_R2_DIR, exist_ok=True)
+
+            # Load enrichment JSONs
+            enrich_jsons = {}
+            for f in glob_mod.glob(
+                    os.path.join(DN2_ENRICH_DIR, "*.json")):
+                name = os.path.splitext(os.path.basename(f))[0]
+                with open(f) as fh:
+                    enrich_jsons[name] = json.load(fh)
+
+            gathered_dir = os.path.join(DN2_PFLOW_DIR, "gathered")
+            pdbs = sorted(glob_mod.glob(
+                os.path.join(gathered_dir, "*.pdb")))
+            parser = Bio_PDB.PDBParser(QUIET=True)
+
+            with open(output.fixpos_csv, "w") as fh:
+                fh.write("pdb_name,motif_index\n")
+                for pdb in pdbs:
+                    stem = os.path.splitext(
+                        os.path.basename(pdb))[0]
+                    # R2 name like "target_5_3" -> parent "target_5"
+                    parent = re.sub(r'_\d+$', '', stem)
+
+                    enrich = enrich_jsons.get(parent, {})
+                    if DESIGN_TYPE == "nanobody":
+                        fixed_str = enrich.get(
+                            "abmpnn_fw_and_enriched_fixed", "")
+                    else:
+                        fixed_str = enrich.get(
+                            "abmpnn_fixed", "")
+
+                    if fixed_str:
+                        struct = parser.get_structure(stem, pdb)
+                        chain_a_len = sum(
+                            1 for r
+                            in struct[0]["A"].get_residues()
+                            if Bio_PDB.is_aa(r, standard=True))
+                        positions = [int(x)
+                                     for x in fixed_str.split()
+                                     if x.strip()]
+                        clipped = [p for p in positions
+                                   if p <= chain_a_len]
+                        fixed_str = " ".join(
+                            str(p) for p in clipped)
+
+                    fh.write(f"{stem},{fixed_str}-\n")
+
+    # ---------------------------------------------------------------
+    # Step 9: R2 Sequence design [GPU]
+    # ---------------------------------------------------------------
+
+    rule dn2_seqdesign_r2:
+        """Step 9: R2 sequence design [GPU].
+        Metal mode: LigandMPNN on backbone+ion PDBs.
+        Non-metal mode: AbMPNN (nanobody) or ProteinMPNN soluble (binder).
+        """
+        input:
+            pflow_done=(
+                os.path.join(DN2_PFLOW_IONS_DIR, ".done")
+                if IS_METAL else
+                os.path.join(DN2_PFLOW_DIR, ".done")
+            ),
+            fixpos_csv=os.path.join(
+                DN2_POS_R2_DIR, "fixed_positions.csv")
+        output:
+            done=touch(os.path.join(DN2_SEQ_R2_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            gathered_dir = os.path.join(DN2_PFLOW_DIR, "gathered")
+            os.makedirs(DN2_SEQ_R2_DIR, exist_ok=True)
+
+            if IS_METAL:
+                # Metal mode: LigandMPNN on backbone+ion PDBs
+                pdb_dir = DN2_PFLOW_IONS_DIR
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+                    f"run_ligandmpnn.py "
+                    f"--input_dir {pdb_dir} "
+                    f"--output_dir {DN2_SEQ_R2_DIR} "
+                    f"--ligandmpnn_dir {LIGANDMPNN_DIR} "
+                    f"--chains_to_design A "
+                    f"--fixed_residues_csv {input.fixpos_csv} "
+                    f"--num_seq_per_target {R2_NUM_SEQ} "
+                    f"--sampling_temp {R2_SAMPLING_TEMP} "
+                    f"--seed 37"
+                )
+            elif DESIGN_TYPE == "nanobody":
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/ProteinMPNN/"
+                    f"protein_mpnn_run.py "
+                    f'--path_to_model_weights '
+                    f'"{PPIFLOW_ROOT}/ProteinMPNN/'
+                    f'model_weights/" '
+                    f'--model_name "abmpnn" '
+                    f'--folder_with_pdbs_path "{gathered_dir}" '
+                    f'--out_folder "{DN2_SEQ_R2_DIR}" '
+                    f'--chain_list "A" '
+                    f'--position_list "{input.fixpos_csv}" '
+                    f"--num_seq_per_target {R2_NUM_SEQ} "
+                    f"--sampling_temp {R2_SAMPLING_TEMP} "
+                    f"--seed 37 "
+                    f"--batch_size {R2_NUM_SEQ} "
+                    f"--omit_AAs C"
+                )
+            else:
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/ProteinMPNN/"
+                    f"protein_mpnn_run.py "
+                    f'--path_to_model_weights '
+                    f'"{PPIFLOW_ROOT}/ProteinMPNN/'
+                    f'soluble_model_weights/" '
+                    f'--model_name "v_48_020" '
+                    f'--folder_with_pdbs_path "{gathered_dir}" '
+                    f'--out_folder "{DN2_SEQ_R2_DIR}" '
+                    f'--chain_list "A" '
+                    f'--position_list "{input.fixpos_csv}" '
+                    f"--num_seq_per_target {R2_NUM_SEQ} "
+                    f"--sampling_temp {R2_SAMPLING_TEMP} "
+                    f"--seed 37 "
+                    f"--batch_size {R2_NUM_SEQ} "
+                    f"--omit_AAs C"
+                )
+
+    # ---------------------------------------------------------------
+    # Step 10: R2 FlowPacker sidechain packing [GPU]
+    # ---------------------------------------------------------------
+
+    DN2_PFLOW_GATHERED = os.path.join(DN2_PFLOW_DIR, "gathered")
+
+    rule dn2_flowpacker_r2:
+        """Step 10: FlowPacker sidechain packing for R2 designs [GPU]."""
+        input:
+            pflow_done=os.path.join(DN2_PFLOW_DIR, ".done"),
+            seqdesign_done=os.path.join(DN2_SEQ_R2_DIR, ".done")
+        output:
+            done=touch(os.path.join(DN2_PACK_R2_DIR, ".done"))
+        resources:
+            mem_mb=16000,
+            gpu=1
+        run:
+            if FLOWPACKER_DIR:
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+                    f"run_flowpacker.py "
+                    f"--backbone_dir {DN2_PFLOW_GATHERED} "
+                    f"--fasta_dir {DN2_SEQ_R2_DIR}/seqs "
+                    f"--output_dir {DN2_PACK_R2_DIR} "
+                    f"--flowpacker_dir {FLOWPACKER_DIR} "
+                    f"--flowpacker_ckpt {FLOWPACKER_CKPT} "
+                    f"--design_chain A"
+                )
+            else:
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+                    f"step06_thread_and_repack.py "
+                    f"--backbone_dir {DN2_PFLOW_GATHERED} "
+                    f"--fasta_dir {DN2_SEQ_R2_DIR}/seqs "
+                    f"--output_dir {DN2_PACK_R2_DIR} "
+                    f"--design_chain A --max_iter 200"
+                )
+
+    # ---------------------------------------------------------------
+    # Step 10b (metal only): copy ions into R2 seqdesign and packed dirs
+    # ---------------------------------------------------------------
+
+    if IS_METAL:
+        rule dn2_copy_ions_for_seqdesign_r2:
+            """Step 10b (metal): Copy ion HETATMs into R2 backbone PDBs for LigandMPNN."""
+            input:
+                pflow_done=os.path.join(DN2_PFLOW_DIR, ".done"),
+                source_pdb=INPUT_PDB
+            output:
+                done=touch(os.path.join(DN2_PFLOW_IONS_DIR, ".done"))
+            resources:
+                mem_mb=4000
+            run:
+                gathered_dir = os.path.join(DN2_PFLOW_DIR, "gathered")
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/copy_ions.py "
+                    f"--source_pdb {INPUT_PDB} "
+                    f"--input_dir {gathered_dir} "
+                    f"--output_dir {DN2_PFLOW_IONS_DIR} "
+                    f"--ion_names '{ION_NAMES}'"
+                )
+
+        rule dn2_copy_ions_r2:
+            """Step 10b (metal): Copy ion HETATMs into packed R2 PDBs for AF3Score."""
+            input:
+                packed_done=os.path.join(DN2_PACK_R2_DIR, ".done"),
+                source_pdb=INPUT_PDB
+            output:
+                done=touch(os.path.join(DN2_PACK_R2_IONS_DIR, ".done"))
+            resources:
+                mem_mb=4000
+            shell:
+                "cd {PPIFLOW_ROOT} && "
+                "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/copy_ions.py "
+                "--source_pdb {input.source_pdb} "
+                "--input_dir {DN2_PACK_R2_DIR} "
+                "--output_dir {DN2_PACK_R2_IONS_DIR} "
+                f"--ion_names '{ION_NAMES}'"
+
+    # ---------------------------------------------------------------
+    # Step 11: R2 AF3Score [GPU, batched via checkpoint]
+    # ---------------------------------------------------------------
+
+    checkpoint dn2_af3score_r2_prepare:
+        """Prepare AF3Score JSON inputs and batches for R2."""
+        input:
+            packed_done=(
+                os.path.join(DN2_PACK_R2_IONS_DIR, ".done")
+                if IS_METAL else
+                os.path.join(DN2_PACK_R2_DIR, ".done")
+            )
+        output:
+            done=touch(os.path.join(
+                DN2_AF3S_R2_DIR, "batch", ".prepared"))
+        resources:
+            mem_mb=8000
+        run:
+            input_dir = DN2_PACK_R2_IONS_DIR if IS_METAL else DN2_PACK_R2_DIR
+            ion_arg = (
+                f"--ion_source_pdb {INPUT_PDB}"
+                if IS_METAL else ""
+            )
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"mkdir -p {DN2_AF3S_R2_DIR}/json "
+                f"{DN2_AF3S_R2_DIR}/batch && "
+                f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/"
+                f"flowpacker_af3score/4.1-prepare_get_json.py "
+                f"--input_dir {input_dir} "
+                f"--output_dir_cif {DN2_AF3S_R2_DIR}/single_chain_cif "
+                f"--save_csv {DN2_AF3S_R2_DIR}/seq.csv "
+                f"--output_dir_json {DN2_AF3S_R2_DIR}/json "
+                f"--batch_dir {DN2_AF3S_R2_DIR}/batch "
+                f"--num_jobs {AF3SCORE_NUM_JOBS} "
+                f"{ion_arg}"
+            )
+
+    rule dn2_af3score_r2_jax_batch:
+        """Convert PDBs to JAX h5 for one R2 AF3Score batch."""
+        input:
+            prepared=os.path.join(
+                DN2_AF3S_R2_DIR, "batch", ".prepared"),
+            batch_json=os.path.join(
+                DN2_AF3S_R2_DIR, "batch", "json", "{batch_name}")
+        output:
+            done=touch(os.path.join(
+                DN2_AF3S_R2_DIR, "batch", "h5",
+                "{batch_name}", ".done"))
+        resources:
+            mem_mb=16000
+        shell:
+            """
+            eval "$('/apps/easybd/programs/miniconda/24.11_environmentally/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+            conda activate {AF3SCORE_DIR}/env
+            export JAX_PLATFORM_NAME=cpu
+            cd {PPIFLOW_ROOT}
+            mkdir -p "{DN2_AF3S_R2_DIR}/batch/h5/{wildcards.batch_name}"
+            {AF3SCORE_PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/4.2_prepare_pdb2jax.py \
+                --pdb_folder "{DN2_AF3S_R2_DIR}/batch/pdb/{wildcards.batch_name}" \
+                --output_folder "{DN2_AF3S_R2_DIR}/batch/h5/{wildcards.batch_name}"
+            """
+
+    rule dn2_af3score_r2_inference:
+        """Run AF3Score inference on one R2 batch [GPU]."""
+        input:
+            jax_done=os.path.join(
+                DN2_AF3S_R2_DIR, "batch", "h5",
+                "{batch_name}", ".done")
+        output:
+            done=touch(os.path.join(
+                DN2_AF3S_R2_DIR, "af3score_output",
+                "{batch_name}", ".done"))
+        resources:
+            mem_mb=32000,
+            gpu=1
+        shell:
+            """
+            eval "$('/apps/easybd/programs/miniconda/24.11_environmentally/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+            conda activate {AF3SCORE_DIR}/env
+            export CUDA_HOME=/apps/easybd/easybuild/amd/software/CUDA/12.4.0
+            export PATH=$CUDA_HOME/bin:$PATH
+            cd {PPIFLOW_ROOT}
+            export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false --xla_gpu_graph_level=0"
+            export XLA_PYTHON_CLIENT_PREALLOCATE=true
+            export XLA_CLIENT_MEM_FRACTION=0.90
+
+            mkdir -p "{DN2_AF3S_R2_DIR}/af3score_output/{wildcards.batch_name}"
+            {AF3SCORE_PYTHON} {PPIFLOW_ROOT}/demo_scripts/flowpacker_af3score/run_af3score.py \
+                --db_dir={AF3SCORE_DB_DIR} \
+                --model_dir={AF3SCORE_MODEL_DIR} \
+                --batch_json_dir="{DN2_AF3S_R2_DIR}/batch/json/{wildcards.batch_name}" \
+                --batch_h5_dir="{DN2_AF3S_R2_DIR}/batch/h5/{wildcards.batch_name}" \
+                --output_dir="{DN2_AF3S_R2_DIR}/af3score_output/{wildcards.batch_name}" \
+                --run_data_pipeline=False \
+                --run_inference=true \
+                --init_guess=true \
+                --num_samples=1 \
+                --write_summary_confidences=true \
+                --write_full_confidences=true
+            """
+
+    def get_dn2_af3score_r2_batches(wildcards):
+        checkpoints.dn2_af3score_r2_prepare.get(**wildcards)
+        batch_json = os.path.join(
+            DN2_AF3S_R2_DIR, "batch", "json")
+        batches = sorted([d for d in os.listdir(batch_json)
+                          if d.startswith("batch_")])
+        return expand(os.path.join(
+            DN2_AF3S_R2_DIR, "af3score_output",
+            "{b}", ".done"), b=batches)
+
+    rule dn2_af3score_r2_metrics:
+        """Extract metrics from R2 AF3Score output."""
+        input:
+            get_dn2_af3score_r2_batches
+        output:
+            csv=os.path.join(
+                DN2_AF3S_R2_DIR, "af3score_results.csv")
+        resources:
+            mem_mb=4000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/demo_scripts/"
+            "flowpacker_af3score/easy_get_metrics.py "
+            "{DN2_AF3S_R2_DIR}/af3score_output "
+            "{output.csv}"
+
+    rule dn2_af3score_r2_filter:
+        """Filter R2 designs by ipTM + pTM thresholds."""
+        input:
+            csv=os.path.join(
+                DN2_AF3S_R2_DIR, "af3score_results.csv"),
+            packed_done=(
+                os.path.join(DN2_PACK_R2_IONS_DIR, ".done")
+                if IS_METAL else
+                os.path.join(DN2_PACK_R2_DIR, ".done")
+            )
+        output:
+            done=touch(os.path.join(
+                DN2_AF3S_R2_DIR, "filtered_links", ".done"))
+        run:
+            import pandas as pd
+            import shutil
+
+            pack_dir = DN2_PACK_R2_IONS_DIR if IS_METAL else DN2_PACK_R2_DIR
+
+            df = pd.read_csv(input.csv)
+            passed = df[
+                (df["iptm"] > R2_IPTM_THRESH) &
+                (df["ptm_A"] > R2_PTM_THRESH)
+            ]
+
+            out_dir = os.path.join(
+                DN2_AF3S_R2_DIR, "filtered_links")
+            os.makedirs(out_dir, exist_ok=True)
+            for _, row in passed.iterrows():
+                src = os.path.join(
+                    pack_dir, row["description"] + ".pdb")
+                if os.path.exists(src):
+                    shutil.copy(src, out_dir)
+            passed.to_csv(os.path.join(
+                DN2_AF3S_R2_DIR, "filtered_results.csv"),
+                index=False)
+            print(f"R2 AF3Score: {len(passed)}/{len(df)} passed "
+                  f"ipTM > {R2_IPTM_THRESH} & "
+                  f"pTM > {R2_PTM_THRESH}")
+
+    # ---------------------------------------------------------------
+    # Step 12: Rosetta relax
+    # ---------------------------------------------------------------
+
+    rule dn2_rosetta_relax:
+        """Rosetta relax on R2 filtered designs."""
+        input:
+            filtered_done=os.path.join(
+                DN2_AF3S_R2_DIR, "filtered_links", ".done")
+        output:
+            done=touch(os.path.join(DN2_RELAX_DIR, ".done"))
+        threads: 4
+        resources:
+            mem_mb=16000
+        run:
+            pdb_input = os.path.join(
+                DN2_AF3S_R2_DIR, "filtered_links")
+            if RELAX_METHOD == "full":
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/"
+                    f"relax_complex.py "
+                    f"--pdb_dir {pdb_input} "
+                    f"--output_dir {DN2_RELAX_DIR} "
+                    f"--batch_idx 0 --dump_pdb True "
+                    f"--num_workers 4"
+                )
+            else:
+                shell(
+                    f"cd {PPIFLOW_ROOT} && "
+                    f"{PYTHON} {PPIFLOW_ROOT}/demo_scripts/"
+                    f"relax_interface.py "
+                    f"--pdb_dir {pdb_input} "
+                    f"--output_dir {DN2_RELAX_DIR} "
+                    f"--batch_idx 0 --dump_pdb True "
+                    f"--num_workers 4"
+                )
+
+    # ---------------------------------------------------------------
+    # Step 13: AF3 Refold [GPU, checkpoint pattern]
+    # ---------------------------------------------------------------
+
+    checkpoint dn2_prepare_af3_jsons:
+        """Create AF3 JSONs for R2 filtered designs."""
+        input:
+            filtered_done=os.path.join(
+                DN2_AF3S_R2_DIR, "filtered_links", ".done")
+        output:
+            done=touch(os.path.join(
+                DN2_AF3_REFOLD_DIR, "json", ".done"))
+        run:
+            shell(
+                f"cd {PPIFLOW_ROOT} && "
+                f"{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+                f"prepare_af3_refold_jsons.py "
+                f"--pdb_dir {DN2_AF3S_R2_DIR}/filtered_links "
+                f"--output_dir {DN2_AF3_REFOLD_DIR}/json "
+                f"--num_seeds {AF3_REFOLD_SEEDS}"
+            )
+
+    rule dn2_af3_refold_single:
+        """Run AF3 on a single design JSON [GPU]."""
+        input:
+            json_file=os.path.join(
+                DN2_AF3_REFOLD_DIR, "json", "{design}.json")
+        output:
+            done=touch(os.path.join(
+                DN2_AF3_REFOLD_DIR, "af3_raw",
+                "{design}.done"))
+        resources:
+            gpu=1,
+            mem_mb=20000
+        shell:
+            "bash {PPIFLOW_ROOT}/workflow/run_af3_single.sh "
+            "{input.json_file} {DN2_AF3_REFOLD_DIR}/af3_raw "
+            "{AF3_HOME} {AF3_MODEL_DIR}"
+
+    rule dn2_convert_af3_output:
+        """Convert AF3 CIF output to PDB for DockQ."""
+        input:
+            af3_done=os.path.join(
+                DN2_AF3_REFOLD_DIR, "af3_raw",
+                "{design}.done")
+        output:
+            done=touch(os.path.join(
+                DN2_AF3_REFOLD_DIR, "pdb",
+                "{design}", ".done"))
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/"
+            "convert_af3_output.py "
+            "--af3_output_dir {DN2_AF3_REFOLD_DIR}/af3_raw "
+            "--design {wildcards.design} "
+            "--output_dir {DN2_AF3_REFOLD_DIR}/pdb/"
+            "{wildcards.design}"
+
+    def aggregate_dn2_af3_refold(wildcards):
+        checkpoint_output = checkpoints.dn2_prepare_af3_jsons.get(
+            **wildcards).output.done
+        json_dir = os.path.join(DN2_AF3_REFOLD_DIR, "json")
+        designs, = glob_wildcards(
+            os.path.join(json_dir, "{d}.json"))
+        designs = [d for d in designs
+                   if d != ".done" and not d.startswith(".")]
+        return expand(os.path.join(
+            DN2_AF3_REFOLD_DIR, "pdb", "{design}", ".done"),
+            design=designs)
+
+    rule dn2_af3_refold_done:
+        """Aggregation: all AF3 refolds complete."""
+        input:
+            aggregate_dn2_af3_refold
+        output:
+            done=touch(os.path.join(
+                DN2_AF3_REFOLD_DIR, ".done"))
+
+    # ---------------------------------------------------------------
+    # Step 14: DockQ scoring
+    # ---------------------------------------------------------------
+
+    rule dn2_dockq:
+        """DockQ scoring of AF3-refolded vs designed."""
+        input:
+            af3_done=os.path.join(
+                DN2_AF3_REFOLD_DIR, ".done"),
+            relax_done=os.path.join(DN2_RELAX_DIR, ".done")
+        output:
+            csv=os.path.join(
+                DN2_DOCKQ_DIR, "summary_dockq_scores.csv")
+        resources:
+            mem_mb=8000
+        shell:
+            "cd {PPIFLOW_ROOT} && "
+            "{PYTHON} {PPIFLOW_ROOT}/pipeline_scripts/run_dockq.py "
+            "--input_dir {DN2_AF3_REFOLD_DIR}/pdb "
+            "--reference_dir {DN2_AF3S_R2_DIR}/filtered_links "
+            "--output_dir {DN2_DOCKQ_DIR} "
+            "--dockq_bin {PPIFLOW_ROOT}/env/bin/DockQ"
+
+    # ---------------------------------------------------------------
+    # Final ranking
+    # ---------------------------------------------------------------
+
+    rule dn2_ranking:
+        """Final ranking: DockQ + interface score + AF3Score."""
+        input:
+            dockq_csv=os.path.join(
+                DN2_DOCKQ_DIR, "summary_dockq_scores.csv"),
+            af3score_csv=os.path.join(
+                DN2_AF3S_R2_DIR, "af3score_results.csv")
+        output:
+            csv=os.path.join(OUTDIR, "final_ranking.csv")
+        run:
+            import pandas as pd
+            import glob as glob_mod
+
+            df_dockq = pd.read_csv(input.dockq_csv)
+
+            relax_csvs = glob_mod.glob(os.path.join(
+                DN2_RELAX_DIR, "rosetta_complex_*.csv"))
+            if relax_csvs:
+                df_relax = pd.concat([pd.read_csv(f) for f in relax_csvs])
+            else:
+                print("WARNING: no rosetta_complex_*.csv found; interface_score set to 0",
+                      file=sys.stderr)
+                df_relax = pd.DataFrame(columns=["pdb_name", "interface_score"])
+
+            df_af3 = pd.read_csv(input.af3score_csv)
+
+            df = df_dockq.merge(
+                df_relax[["pdb_name", "interface_score"]],
+                left_on="FolderName", right_on="pdb_name",
+                how="left"
+            )
+            df["interface_score"] = df["interface_score"].fillna(0)
+            df = df.merge(
+                df_af3[["description", "iptm", "ptm_A"]],
+                left_on="FolderName", right_on="description",
+                how="left"
+            )
+
+            filtered = df[
+                (df["Overall_Avg_DockQ"] > FINAL_DOCKQ) &
+                (df["ptm_A"] > FINAL_PTM) &
+                (df["iptm"] > FINAL_IPTM)
+            ].copy()
+            filtered["score"] = (
+                filtered["iptm"] * 100
+            ) - filtered["interface_score"]
+            filtered = filtered.sort_values(
+                "score", ascending=False)
+
+            if FINAL_TOP_N > 0:
+                filtered = filtered.head(FINAL_TOP_N)
+
+            filtered.to_csv(output.csv, index=False)
+            print(f"{len(filtered)} designs passed all filters")
+            if not filtered.empty:
+                print("\nTop designs:")
+                print(filtered[[
+                    "FolderName", "Overall_Avg_DockQ",
+                    "iptm", "ptm_A", "interface_score",
+                    "score"
+                ]].head(10).to_string(index=False))

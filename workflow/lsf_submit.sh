@@ -1,0 +1,43 @@
+#!/bin/bash
+# Snakemake LSF cluster submission wrapper.
+#
+# Usage:
+#   snakemake --cluster "bash workflow/lsf_submit.sh {resources.gpu} \
+#     {resources.mem_mb} {threads} {rule}" ...
+#
+# Handles GPU vs CPU-only jobs automatically.
+
+GPU=$1
+MEM_MB=$2
+THREADS=$3
+RULE=$4
+shift 4
+
+mkdir -p logs
+
+GPU_FLAG=""
+QUEUE="short"
+WALL_TIME="6:00"
+if [ "$GPU" -gt 0 ] 2>/dev/null; then
+    GPU_FLAG="-gpu num=${GPU}"
+    QUEUE="long-gpu"
+    WALL_TIME="96:00"
+fi
+# Multi-threaded CPU jobs (e.g. Rosetta relax) need longer wall time
+if [ "$THREADS" -gt 4 ] 2>/dev/null; then
+    QUEUE="medium"
+    WALL_TIME="24:00"
+fi
+
+# Convert total mem_mb to per-slot (LSF reserves per-slot by default)
+MEM_PER_SLOT=$(( (MEM_MB + THREADS - 1) / THREADS ))
+
+bsub -q "$QUEUE" \
+    $GPU_FLAG \
+    -n "$THREADS" \
+    -R "rusage[mem=${MEM_PER_SLOT}]" \
+    -W "$WALL_TIME" \
+    -J "$RULE" \
+    -o "logs/${RULE}.%J.out" \
+    -e "logs/${RULE}.%J.err" \
+    "$@"

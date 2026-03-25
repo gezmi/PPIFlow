@@ -1,0 +1,38 @@
+# LSF cluster profile for PPIFlow Snakemake workflow (Snakemake 7)
+#
+# Usage:
+#   snakemake --snakefile workflow/Snakefile \
+#     --configfile workflow/config_affinity.yaml \
+#     --profile workflow/profiles/lsf \
+#     -- target_affinity
+
+cluster: "bsub -q {resources.lsf_queue} -n {threads} -R 'rusage[mem={resources.mem_mb}]' {resources.lsf_extra} -o logs/sm_{rule}_%J.out -e logs/sm_{rule}_%J.err"
+latency-wait: 120
+jobs: 50
+
+default-resources:
+  - lsf_queue=short
+  - mem_mb=8000
+  - lsf_extra=" "
+
+set-resources:
+  - partial_flow:lsf_queue=short-gpu
+  - partial_flow:lsf_extra=-gpu "num=1"
+  - partial_flow:mem_mb=16000
+  - abmpnn:lsf_queue=short-gpu
+  - abmpnn:lsf_extra=-gpu "num=1"
+  - abmpnn:mem_mb=16000
+  - sidechain_packing:mem_mb=16000
+  - af3score_jax:lsf_queue=short-gpu
+  - af3score_jax:lsf_extra=-gpu "num=1"
+  - af3score_jax:mem_mb=16000
+  - af3score_inference:lsf_queue=short-gpu
+  - af3score_inference:lsf_extra=-gpu "num=1"
+  - af3score_inference:mem_mb=32000
+  - rosetta_relax_affinity:mem_mb=16000
+  - rosetta_relax_full:mem_mb=16000
+
+set-threads:
+  - sidechain_packing=4
+  - rosetta_relax_affinity=4
+  - rosetta_relax_full=4

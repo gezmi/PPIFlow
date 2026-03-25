@@ -1,0 +1,34 @@
+# PPIFlow Full Pipeline Configuration (with AF3Score)
+#
+# Usage:
+#   snakemake --snakefile workflow/Snakefile \
+#     --configfile workflow/config_full.yaml target_full
+#
+# After Phase 1 completes, run AF3 refolding externally, then:
+#   snakemake --snakefile workflow/Snakefile \
+#     --configfile workflow/config_full.yaml score_full
+
+# --- Input ---
+input_file: "/path/to/complex.cif"
+output_dir: "/path/to/output"
+name: "my_target"
+input_type: "cif"                       # "cif" or "pdb"
+
+# --- Chain IDs (in the input file) ---
+nanobody_chain: "B"
+receptor_chain: "A"
+
+# --- Design parameters ---
+energy_threshold: -5.0
+start_t: 0.6
+samples_per_target: 8
+num_seq_per_target: 4
+sampling_temp: 0.1
+
+# --- Flexible target residues (optional) ---
+# flexible_target_residues: "C45,C50-55"  # Target residues to perturb
+# flexibility_sigma: 0.5                   # Noise magnitude (Angstroms)
+
+# --- AF3Score (required for full pipeline) ---
+af3score_dir: "/path/to/af3score"
+af3score_num_jobs: 4
